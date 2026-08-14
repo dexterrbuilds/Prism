@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import suppress
 from datetime import UTC, datetime
 from hashlib import sha256
 
@@ -30,6 +29,28 @@ class Scanner:
         self.telegram = telegram
         self.health = health
         self.store = SignalStore(max_size=128)
+        self._manual_scan_event = asyncio.Event()
+
+    def request_manual_scan(self) -> bool:
+        """Wake the scanner once; never overlap an active watchlist scan."""
+        if self.health.scanner == "running" or self._manual_scan_event.is_set():
+            return False
+        self._manual_scan_event.set()
+        return True
+
+    async def _wait_for_next_scan(self, stop_event: asyncio.Event) -> None:
+        stop_task = asyncio.create_task(stop_event.wait())
+        manual_task = asyncio.create_task(self._manual_scan_event.wait())
+        done, pending = await asyncio.wait(
+            {stop_task, manual_task},
+            timeout=self.settings.scan_interval_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if manual_task in done:
+            self._manual_scan_event.clear()
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.health.scanner = "running"
@@ -54,8 +75,7 @@ class Scanner:
             self.health.scan_errors += failures
             self.health.scanner = "sleeping"
             logger.info("scan_completed duration_seconds=%.3f failures=%d", time.monotonic() - started, failures)
-            with suppress(TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=self.settings.scan_interval_seconds)
+            await self._wait_for_next_scan(stop_event)
         self.health.scanner = "stopped"
 
     async def _scan_symbol(self, symbol: str, as_of_ms: int) -> bool:

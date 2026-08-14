@@ -6,6 +6,12 @@ services:
     healthCheckPath: /health
     envVars:
       - key: DRY_RUN
-        value: "true"
+        value: "false"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "2700"
       - key: EXCHANGE
         value: binance
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

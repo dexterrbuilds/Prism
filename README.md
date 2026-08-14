@@ -41,7 +41,7 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `EXCHANGE` | `binance` | `binance` USD-M futures or `bybit` linear swaps |
 | `WATCHLIST` | five requested pairs | Comma-separated CCXT symbols |
 | `PORT` | `10000` | Health server port |
-| `SCAN_INTERVAL_SECONDS` | `60` | Delay after the complete watchlist |
+| `SCAN_INTERVAL_SECONDS` | `2700` | Delay after the complete watchlist (45 minutes) |
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
@@ -60,6 +60,25 @@ mypy app
 ```
 
 For safe real-market verification, leave `DRY_RUN=true`. It still loads markets, fetches live futures OHLCV, performs the complete analysis, and logs signals that would be delivered.
+
+For Telegram delivery every 45-minute scan cycle, configure the destination privately in the deployment environment:
+
+```bash
+DRY_RUN=false
+SCAN_INTERVAL_SECONDS=2700
+TELEGRAM_BOT_TOKEN=<BotFather token>
+TELEGRAM_CHAT_ID=<destination chat ID>
+```
+
+Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
+
+### Telegram commands
+
+- `/start` confirms that Prism is online and displays the exchange, 45-minute cadence, watchlist, and WATCH-alert policy. It does not force an immediate scan or manufacture a signal.
+- `/status` displays scanner state, exchange, delivery mode, cadence, last completed scan, completed-symbol count, and cumulative scan errors.
+- **Run Manual Scan** appears below both command responses. It wakes the normal scanner loop immediately without creating an overlapping scan. If a scan is already running, the request is rejected with a status message.
+
+Commands only respond in the configured `TELEGRAM_CHAT_ID`. The command menu is registered automatically at startup.
 
 ## Docker
 

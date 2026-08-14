@@ -57,7 +57,7 @@ class Settings:
             watchlist=_csv("WATCHLIST", DEFAULT_WATCHLIST),
             timeframes=("4h", "1h", "15m"),
             candle_limit=candle_limit,
-            scan_interval_seconds=max(15.0, float(os.getenv("SCAN_INTERVAL_SECONDS", "60"))),
+            scan_interval_seconds=max(15.0, float(os.getenv("SCAN_INTERVAL_SECONDS", "2700"))),
             request_timeout_ms=max(1_000, int(os.getenv("REQUEST_TIMEOUT_MS", "15000"))),
             request_concurrency=max(1, min(10, int(os.getenv("REQUEST_CONCURRENCY", "3")))),
             request_retries=max(0, min(6, int(os.getenv("REQUEST_RETRIES", "3")))),

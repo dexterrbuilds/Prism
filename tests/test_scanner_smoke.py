@@ -41,3 +41,14 @@ async def test_complete_offline_dry_run_scan_does_not_require_a_signal(monkeypat
     telegram = FakeTelegram()
     scanner = Scanner(settings, FakeExchange(), telegram, RuntimeHealth("fake"))  # type: ignore[arg-type]
     assert await scanner._scan_symbol("BTC/USDT", 1_800_000_000_000)
+
+
+def test_manual_scan_request_is_queued_once_and_never_overlaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DRY_RUN", "true")
+    health = RuntimeHealth("fake", scanner="sleeping")
+    scanner = Scanner(Settings.from_env(), FakeExchange(), FakeTelegram(), health)  # type: ignore[arg-type]
+    assert scanner.request_manual_scan()
+    assert not scanner.request_manual_scan()
+    health.scanner = "running"
+    scanner._manual_scan_event.clear()
+    assert not scanner.request_manual_scan()

@@ -33,8 +33,9 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop_event.set)
     health = RuntimeHealth(settings.exchange)
     exchange = ExchangeClient(settings)
-    telegram = TelegramService(settings)
+    telegram = TelegramService(settings, health)
     scanner = Scanner(settings, exchange, telegram, health)
+    telegram.bind_manual_scan(scanner.request_manual_scan)
     app = create_app(health)
     server = EmbeddedServer(uvicorn.Config(app, host="0.0.0.0", port=settings.port, log_level=settings.log_level.lower(), access_log=False, log_config=None))
     scanner_task: asyncio.Task[None] | None = None
