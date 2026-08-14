@@ -31,7 +31,13 @@ class ExchangeClient:
 
     def __init__(self, settings: Settings) -> None:
         exchange_class = getattr(ccxt, settings.exchange)
-        options: dict[str, Any] = {"defaultType": "future" if settings.exchange == "binance" else "swap"}
+        options: dict[str, Any] = {
+            "defaultType": "future" if settings.exchange == "binance" else "swap",
+            # This service is linear-futures-only. Avoid spot, inverse, and options
+            # metadata endpoints, which add latency and may be regionally unavailable.
+            "fetchMarkets": {"types": ["linear"]},
+            "fetchCurrencies": False,
+        }
         self._client = exchange_class(
             {
                 "enableRateLimit": True,
@@ -96,7 +102,8 @@ class ExchangeClient:
                 await asyncio.sleep(delay)
             except (ccxt.BaseError, ValueError, TypeError) as exc:
                 raise ExchangeRequestError(f"{name}: {type(exc).__name__}") from exc
-        raise ExchangeRequestError(f"{name}: retries exhausted ({type(last_error).__name__})") from last_error
+        detail = str(last_error).replace("\n", " ")[:300] if last_error else "unknown error"
+        raise ExchangeRequestError(f"{name}: retries exhausted ({type(last_error).__name__}: {detail})") from last_error
 
     def clear_cycle_cache(self) -> None:
         self._cache.clear()

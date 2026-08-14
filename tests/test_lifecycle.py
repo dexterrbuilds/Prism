@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -18,6 +19,14 @@ def test_deduplication_requires_meaningful_change() -> None:
     assert store.should_publish(make_signal())
     assert not store.should_publish(make_signal())
     assert store.should_publish(make_signal(score=90))
+
+
+def test_deduplication_collapses_strategy_labels_for_same_direction() -> None:
+    store = SignalStore()
+    first = make_signal()
+    overlapping = replace(first, strategy="BOS_CONTINUATION", id="second")
+    assert store.should_publish(first)
+    assert not store.should_publish(overlapping)
 
 
 def test_signal_state_transitions_are_guarded() -> None:

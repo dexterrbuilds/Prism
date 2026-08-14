@@ -7,6 +7,24 @@ class RiskPlanningError(ValueError):
     pass
 
 
+def estimate_hold_time(strategy: str, target_distance_atr: float) -> tuple[float, float]:
+    """Technical horizon estimate, not an empirical performance statistic."""
+    if target_distance_atr <= 0:
+        raise RiskPlanningError("target ATR distance must be positive")
+    if any(token in strategy for token in ("REVERSAL", "HEAD_AND_SHOULDERS", "DOUBLE_")):
+        hours_per_atr = 4.5
+    elif any(token in strategy for token in ("BREAKOUT", "BREAKDOWN", "MOMENTUM", "BOS_")):
+        hours_per_atr = 2.75
+    elif "PULLBACK" in strategy or "RETEST" in strategy:
+        hours_per_atr = 3.5
+    else:
+        hours_per_atr = 3.25
+    center = target_distance_atr * hours_per_atr
+    low = max(4.0, min(72.0, round(center * 0.65)))
+    high = max(low + 2.0, min(120.0, round(center * 1.6)))
+    return low, high
+
+
 def two_r_target(entry: float, stop: float, direction: Direction) -> float:
     risk = abs(entry - stop)
     if risk <= 0:
@@ -54,6 +72,7 @@ def build_trade_plan(
     meaningful = [zone for zone in opposing if zone.score >= 3.0]
     tp1 = meaningful[0].midpoint if meaningful else (preferred + risk if candidate.direction is Direction.LONG else preferred - risk)
     tp3 = meaningful[1].midpoint if len(meaningful) > 1 else None
+    hold_low, hold_high = estimate_hold_time(candidate.strategy, abs(tp2 - preferred) / atr)
     return TradePlan(
         candidate.ideal_entry_low,
         candidate.ideal_entry_high,
@@ -68,6 +87,8 @@ def build_trade_plan(
         tp2,
         tp3,
         2.0,
+        hold_low,
+        hold_high,
     )
 
 

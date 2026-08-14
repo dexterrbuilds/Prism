@@ -238,6 +238,8 @@ class TradePlan:
     tp2: float
     tp3: float | None
     reward_risk: float
+    estimated_hold_hours_low: float | None = None
+    estimated_hold_hours_high: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +255,7 @@ class Signal:
     trade: TradePlan
     evidence: tuple[str, ...]
     created_at: datetime
+    supporting_strategies: tuple[str, ...] = ()
 
     @staticmethod
     def utcnow() -> datetime:

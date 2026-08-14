@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.models import ConfluenceEvidence, Direction, SetupCandidate, SignalGrade, StructureBias, StructureState
-from app.signals.risk import build_trade_plan, is_entry_too_late, two_r_target
+from app.signals.risk import build_trade_plan, estimate_hold_time, is_entry_too_late, two_r_target
 from app.signals.scoring import CATEGORY_CAPS, grade_score, score_candidate
 from tests.helpers import analysis_context, candles
 
@@ -26,7 +26,15 @@ def test_atr_structure_stop_and_two_r() -> None:
     assert plan.risk_per_unit == pytest.approx(4.3)
     assert plan.tp2 == pytest.approx(108.6)
     assert plan.stop_distance_atr == pytest.approx(2.15)
+    assert plan.estimated_hold_hours_low is not None
+    assert plan.estimated_hold_hours_high is not None
+    assert plan.estimated_hold_hours_high > plan.estimated_hold_hours_low
     assert two_r_target(100, 104, Direction.SHORT) == 92
+
+
+def test_hold_time_is_a_bounded_technical_estimate() -> None:
+    low, high = estimate_hold_time("BREAKOUT_RETEST", 4.0)
+    assert 4 <= low < high <= 120
 
 
 def test_entry_too_late_is_directional_and_atr_relative() -> None:

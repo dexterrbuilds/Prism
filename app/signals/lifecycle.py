@@ -25,14 +25,15 @@ def transition(signal: Signal, target: SignalState) -> Signal:
     return replace(signal, state=target)
 
 
-def signal_key(symbol: str, strategy: str, direction: Direction) -> str:
-    return f"{symbol}|{strategy}|{direction.value}"
+def signal_key(symbol: str, direction: Direction) -> str:
+    """One active directional thesis per symbol, independent of detector label."""
+    return f"{symbol}|{direction.value}"
 
 
 def signal_fingerprint(signal: Signal) -> str:
     risk = max(signal.trade.risk_per_unit, 1e-12)
     normalized_entry = round(signal.trade.preferred_entry / risk, 1)
-    raw = f"{signal_key(signal.symbol, signal.strategy, signal.direction)}|{normalized_entry}|{signal.score // 5}|{signal.state.value}"
+    raw = f"{signal_key(signal.symbol, signal.direction)}|{normalized_entry}|{signal.score // 5}|{signal.state.value}"
     return sha256(raw.encode()).hexdigest()[:20]
 
 
@@ -46,7 +47,7 @@ class SignalStore:
         fingerprint = signal_fingerprint(signal)
         if fingerprint in self._fingerprints:
             return False
-        key = signal_key(signal.symbol, signal.strategy, signal.direction)
+        key = signal_key(signal.symbol, signal.direction)
         previous = self._signals.get(key)
         if previous:
             entry_change = abs(signal.trade.preferred_entry - previous.trade.preferred_entry) / max(previous.trade.risk_per_unit, 1e-12)

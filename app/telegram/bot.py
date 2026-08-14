@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from io import BytesIO
 from typing import Any
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -122,7 +123,7 @@ class TelegramService:
             self._initialized = False
         logger.info("telegram_stopped")
 
-    async def publish(self, signal: Signal, lifecycle: bool = False) -> bool:
+    async def publish(self, signal: Signal, lifecycle: bool = False, chart_png: bytes | None = None) -> bool:
         text = format_lifecycle(signal) if lifecycle else format_watch(signal) if signal.grade is SignalGrade.WATCH else format_signal(signal)
         if self._settings.dry_run:
             logger.info("telegram_dry_run symbol=%s strategy=%s score=%d state=%s", signal.symbol, signal.strategy, signal.score, signal.state.value)
@@ -131,12 +132,35 @@ class TelegramService:
             logger.error("telegram_failure reason=not_configured")
             return False
         try:
-            await self._application.bot.send_message(
-                chat_id=self._settings.telegram_chat_id,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
+            if chart_png and not lifecycle:
+                chart = BytesIO(chart_png)
+                chart.name = f"{signal.symbol.replace('/', '-')}-{signal.strategy.lower()}.png"
+                if len(text) <= 1024:
+                    await self._application.bot.send_photo(
+                        chat_id=self._settings.telegram_chat_id,
+                        photo=chart,
+                        caption=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                else:
+                    await self._application.bot.send_photo(
+                        chat_id=self._settings.telegram_chat_id,
+                        photo=chart,
+                        caption=f"{signal.symbol} — {signal.direction.value} analysis chart",
+                    )
+                    await self._application.bot.send_message(
+                        chat_id=self._settings.telegram_chat_id,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        disable_web_page_preview=True,
+                    )
+            else:
+                await self._application.bot.send_message(
+                    chat_id=self._settings.telegram_chat_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
             logger.info("telegram_success symbol=%s strategy=%s state=%s", signal.symbol, signal.strategy, signal.state.value)
             return True
         except Exception as exc:

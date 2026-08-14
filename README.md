@@ -6,6 +6,8 @@ Prism is a deterministic, asynchronous crypto-futures technical-analysis researc
 
 The runtime owns one persistent CCXT client. Each scan fetches at most 250 closed candles for `4h`, `1h`, and `15m`, with bounded concurrency and retry/backoff. NumPy arrays flow through pure analysis functions into modular setup detectors. Candidates pass category-capped scoring, entry/chase, structural stop, 2R, opposing-structure, volume, volatility, and higher-timeframe filters. A bounded lifecycle store deduplicates alerts.
 
+All valid candidates for a symbol are ranked before publication. Only one directional thesis can be sent per symbol per scan; overlapping detector labels are shown as supporting setups on that alert. Near-tied opposing directions are rejected as ambiguous. Deduplication is keyed by symbol and direction rather than strategy label.
+
 ```text
 CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> momentum / volume / volatility / candles / patterns / divergence / liquidity
@@ -71,6 +73,10 @@ TELEGRAM_CHAT_ID=<destination chat ID>
 ```
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
+
+Initial signal alerts include a bounded 1000×650 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, entry zone, stop, TP1, and the 2R target. Charts are rendered only for the selected alert and released after delivery.
+
+Signals also include an estimated holding-time range derived from the 1H timeframe, ATR distance to TP2, and setup family. It is explicitly labeled as a technical estimate—not a historical average or probability. A genuine average should be added only after enough lifecycle/backtest outcomes have been collected.
 
 ### Telegram commands
 

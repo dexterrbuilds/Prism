@@ -17,37 +17,49 @@ def _price(value: float) -> str:
 
 def format_signal(signal: Signal) -> str:
     icon = "🟢" if signal.direction is Direction.LONG else "🔴"
-    evidence = "\n".join(f"• {item}" for item in signal.evidence[:8])
+    evidence = "\n".join(f"• {item[:68]}" for item in signal.evidence[:5])
     strategy = signal.strategy.replace("_", " ").title()
+    supporting = ""
+    if signal.supporting_strategies:
+        names = " · ".join(name.replace("_", " ").title() for name in signal.supporting_strategies[:2])
+        supporting = f"\nSupports: {names}"
+    hold_time = "Not calibrated"
+    if signal.trade.estimated_hold_hours_low is not None and signal.trade.estimated_hold_hours_high is not None:
+        hold_time = f"{signal.trade.estimated_hold_hours_low:g}–{signal.trade.estimated_hold_hours_high:g}h"
     return (
-        f"{icon} *{signal.symbol} — {signal.direction.value}*\n\n"
-        f"*Strategy*\n{strategy}\n"
-        f"*Market Regime*\n{signal.regime.value.replace('_', ' ').title()}\n"
-        f"*Confluence Score*\n{signal.score}/100\n"
-        f"*Entry Zone*\n{_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
-        f"*Preferred Entry*\n{_price(signal.trade.preferred_entry)}\n"
-        f"*Stop Loss*\n{_price(signal.trade.stop_loss)}\n"
-        f"*TP1*\n{_price(signal.trade.tp1)}\n"
-        f"*TP2 — 2R*\n{_price(signal.trade.tp2)}\n"
-        f"*Risk : Reward*\n1 : {signal.trade.reward_risk:.2f}\n"
-        f"*Evidence*\n{evidence}\n"
-        f"*Invalidation*\n{signal.trade.invalidation_reason}\n\n"
-        "⚠️ Technical-analysis research signal. Not financial advice."
+        f"{icon} *{signal.symbol} · {signal.direction.value}*\n"
+        f"*{strategy}* · {signal.grade.value}\n"
+        f"{signal.regime.value.replace('_', ' ').title()} · Confluence {signal.score}/100"
+        f"{supporting}\n\n"
+        "🎯 *Trade Plan*\n"
+        f"Entry: {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
+        f"Preferred: {_price(signal.trade.preferred_entry)}\n"
+        f"Stop: {_price(signal.trade.stop_loss)}\n"
+        f"TP1: {_price(signal.trade.tp1)}\n"
+        f"TP2 (2R): {_price(signal.trade.tp2)}\n"
+        f"R:R  1:{signal.trade.reward_risk:.2f} · Hold estimate {hold_time}\n\n"
+        "🔎 *Why It Qualifies*\n"
+        f"{evidence}\n\n"
+        "🛑 *Invalidation*\n"
+        f"{signal.trade.invalidation_reason}\n\n"
+        "⚠️ Research signal only. Hold time is a technical estimate, not financial advice."
     )
 
 
 def format_watch(signal: Signal) -> str:
     return (
-        f"🟡 *{signal.symbol} — WATCH*\n\n"
-        f"*Setup*\n{signal.strategy.replace('_', ' ').title()}\n"
-        f"*Confluence Score*\n{signal.score}/100\n"
-        f"*Confirmation Required*\n{signal.trade.trigger}\n"
-        f"*Invalidation*\n{_price(signal.trade.stop_loss)}"
+        f"🟡 *{signal.symbol} · WATCH*\n"
+        f"*{signal.strategy.replace('_', ' ').title()}* · Confluence {signal.score}/100\n\n"
+        "🔎 *Confirmation Needed*\n"
+        f"{signal.trade.trigger}\n\n"
+        f"🛑 *Invalidation*\n{_price(signal.trade.stop_loss)}"
     )
 
 
 def format_lifecycle(signal: Signal) -> str:
-    return f"ℹ️ *{signal.symbol} {signal.direction.value}* — {signal.state.value.replace('_', ' ')} at {_price(signal.trade.preferred_entry)}"
+    icons = {"ACTIVE": "🚀", "TP1_HIT": "🎯", "TP2_HIT": "✅", "STOPPED": "🛑", "INVALIDATED": "⚠️", "EXPIRED": "⌛"}
+    icon = icons.get(signal.state.value, "ℹ️")
+    return f"{icon} *{signal.symbol} · {signal.direction.value}*\n{signal.state.value.replace('_', ' ').title()} · {signal.strategy.replace('_', ' ').title()}"
 
 
 def _cadence(settings: Settings) -> str:
@@ -71,7 +83,7 @@ def format_start(settings: Settings) -> str:
 
 
 def format_status(settings: Settings, health: RuntimeHealth) -> str:
-    healthy = health.scanner in {"running", "sleeping"}
+    healthy = health.healthy
     icon = "🟢" if healthy else "🟠"
     last_scan = (
         datetime.fromtimestamp(health.last_scan_ms / 1000, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -90,5 +102,7 @@ def format_status(settings: Settings, health: RuntimeHealth) -> str:
         f"*WATCH Alerts*\n{watch_alerts.title()}\n"
         f"*Last Completed Scan*\n{last_scan}\n"
         f"*Symbols Completed*\n{health.scanned_symbols}/{len(settings.watchlist)}\n"
+        f"*Last Scan Errors*\n{health.last_scan_errors}\n"
         f"*Cumulative Scan Errors*\n{health.scan_errors}"
+        + (f"\n*Latest Error*\n{health.last_error.replace('_', ' ')[:240]}" if health.last_error else "")
     )

@@ -32,6 +32,23 @@ def test_status_message_reports_runtime_health_without_secrets(monkeypatch) -> N
     assert "token" not in message.lower()
 
 
+def test_status_marks_failed_latest_scan_as_degraded(monkeypatch) -> None:
+    settings = Settings.from_env()
+    health = RuntimeHealth(
+        "binance",
+        scanner="sleeping",
+        last_scan_ms=1_800_000_000_000,
+        scanned_symbols=0,
+        scan_errors=5,
+        last_scan_errors=5,
+        last_error="BTC/USDT 4h: ExchangeRequestError",
+    )
+    message = format_status(settings, health)
+    assert "Starting or degraded" in message
+    assert "Last Scan Errors*\n5" in message
+    assert "Latest Error" in message
+
+
 def test_manual_scan_button_callback_data_is_stable() -> None:
     keyboard = TelegramService._manual_scan_keyboard()
     button = keyboard.inline_keyboard[0][0]
