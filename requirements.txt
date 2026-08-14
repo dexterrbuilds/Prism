@@ -1,0 +1,6 @@
+numpy>=1.26,<3
+TA-Lib>=0.6.5,<0.7
+ccxt>=4.4,<5
+python-telegram-bot>=20,<23
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

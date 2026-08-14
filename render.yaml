@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: prism-signal-engine
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DRY_RUN
+        value: "true"
+      - key: EXCHANGE
+        value: binance
