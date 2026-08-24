@@ -8,6 +8,8 @@ The runtime owns one persistent CCXT client. Each scan fetches at most 250 close
 
 All valid candidates for a symbol are ranked before publication. Only one directional thesis can be sent per symbol per scan; overlapping detector labels are shown as supporting setups on that alert. Near-tied opposing directions are rejected as ambiguous. Deduplication is keyed by symbol and direction rather than strategy label.
 
+Trade geometry is validated before publication. LONG plans must satisfy `stop < entry < TP1 <= TP2 < TP3` (when TP3 exists); SHORT plans use the exact inverse. TP1 may use opposing structure only when it lies between entry and the 2R target. Structure beyond 2R is treated as TP3, never mislabeled as TP1.
+
 ```text
 CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> momentum / volume / volatility / candles / patterns / divergence / liquidity
@@ -39,7 +41,8 @@ All secrets come from the environment. Load `.env` with your process manager or 
 |---|---:|---|
 | `DRY_RUN` | `true` | Analyze real data and log would-send events without Telegram delivery |
 | `TELEGRAM_BOT_TOKEN` | — | Required when dry-run is false |
-| `TELEGRAM_CHAT_ID` | — | Required when dry-run is false |
+| `TELEGRAM_CHAT_ID` | — | Backward-compatible primary recipient |
+| `TELEGRAM_CHAT_IDS` | — | Comma-separated DM/group recipients; de-duplicated with the primary ID |
 | `EXCHANGE` | `binance` | `binance` USD-M futures or `bybit` linear swaps |
 | `WATCHLIST` | five requested pairs | Comma-separated CCXT symbols |
 | `PORT` | `10000` | Health server port |
@@ -70,11 +73,16 @@ DRY_RUN=false
 SCAN_INTERVAL_SECONDS=2700
 TELEGRAM_BOT_TOKEN=<BotFather token>
 TELEGRAM_CHAT_ID=<destination chat ID>
+TELEGRAM_CHAT_IDS=<additional ID>,<additional ID>
 ```
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
 
-Initial signal alerts include a bounded 1000×650 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, entry zone, stop, TP1, and the 2R target. Charts are rendered only for the selected alert and released after delivery.
+Initial signal alerts include a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
+
+Each configured Telegram recipient receives the same deduplicated alert independently; one failed DM does not prevent delivery to the others. A Telegram user must start the bot first before Telegram permits the bot to initiate that DM.
+
+The alert includes hypothetical `$5,000` margin examples at 2× and 5× leverage, showing notional size, approximate base-asset quantity, and linear P/L at stop, TP1, and TP2. These examples exclude fees, funding, slippage, maintenance margin, and liquidation mechanics and are not position-sizing advice.
 
 Signals also include an estimated holding-time range derived from the 1H timeframe, ATR distance to TP2, and setup family. It is explicitly labeled as a technical estimate—not a historical average or probability. A genuine average should be added only after enough lifecycle/backtest outcomes have been collected.
 
@@ -84,7 +92,7 @@ Signals also include an estimated holding-time range derived from the 1H timefra
 - `/status` displays scanner state, exchange, delivery mode, cadence, last completed scan, completed-symbol count, and cumulative scan errors.
 - **Run Manual Scan** appears below both command responses. It wakes the normal scanner loop immediately without creating an overlapping scan. If a scan is already running, the request is rejected with a status message.
 
-Commands only respond in the configured `TELEGRAM_CHAT_ID`. The command menu is registered automatically at startup.
+Commands only respond in configured `TELEGRAM_CHAT_ID` / `TELEGRAM_CHAT_IDS` destinations. The command menu is registered automatically at startup.
 
 ## Docker
 

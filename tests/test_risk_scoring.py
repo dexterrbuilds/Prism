@@ -2,8 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from app.models import ConfluenceEvidence, Direction, SetupCandidate, SignalGrade, StructureBias, StructureState
-from app.signals.risk import build_trade_plan, estimate_hold_time, is_entry_too_late, two_r_target
+from app.models import (
+    ConfluenceEvidence,
+    Direction,
+    SetupCandidate,
+    SignalGrade,
+    StructureBias,
+    StructureState,
+    SupportResistanceZone,
+    ZoneKind,
+)
+from app.signals.risk import build_trade_plan, estimate_hold_time, is_entry_too_late, trade_geometry_valid, two_r_target
 from app.signals.scoring import CATEGORY_CAPS, grade_score, score_candidate
 from tests.helpers import analysis_context, candles
 
@@ -35,6 +44,33 @@ def test_atr_structure_stop_and_two_r() -> None:
 def test_hold_time_is_a_bounded_technical_estimate() -> None:
     low, high = estimate_hold_time("BREAKOUT_RETEST", 4.0)
     assert 4 <= low < high <= 120
+
+
+def test_long_targets_are_ordered_and_structure_beyond_2r_becomes_tp3() -> None:
+    zones = (
+        SupportResistanceZone(106.9, 107.1, ZoneKind.RESISTANCE, 4, 2, ("swing",), 1),
+        SupportResistanceZone(111.9, 112.1, ZoneKind.RESISTANCE, 6, 2, ("weekly",), 1),
+    )
+    plan = build_trade_plan(setup(Direction.LONG), current_price=100, atr=2, zones=zones)
+    assert plan.stop_loss < plan.preferred_entry < plan.tp1 <= plan.tp2
+    assert plan.tp1 == pytest.approx(107)
+    assert plan.tp3 == pytest.approx(112)
+    assert trade_geometry_valid(plan, Direction.LONG)
+
+
+def test_long_tp1_falls_back_to_1r_when_nearest_structure_is_beyond_2r() -> None:
+    zones = (SupportResistanceZone(111.9, 112.1, ZoneKind.RESISTANCE, 6, 2, ("weekly",), 1),)
+    plan = build_trade_plan(setup(Direction.LONG), current_price=100, atr=2, zones=zones)
+    assert plan.tp1 == pytest.approx(plan.preferred_entry + plan.risk_per_unit)
+    assert plan.tp1 < plan.tp2 < plan.tp3
+
+
+def test_short_targets_are_strictly_direction_aware() -> None:
+    zones = (SupportResistanceZone(93.9, 94.1, ZoneKind.SUPPORT, 4, 2, ("swing",), 1),)
+    plan = build_trade_plan(setup(Direction.SHORT), current_price=100, atr=2, zones=zones)
+    assert plan.stop_loss > plan.preferred_entry > plan.tp1 >= plan.tp2
+    assert plan.tp1 == pytest.approx(94)
+    assert trade_geometry_valid(plan, Direction.SHORT)
 
 
 def test_entry_too_late_is_directional_and_atr_relative() -> None:

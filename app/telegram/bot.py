@@ -41,7 +41,7 @@ class TelegramService:
 
     def _authorized(self, update: Update) -> bool:
         chat = update.effective_chat
-        return bool(chat and self._settings.telegram_chat_id and str(chat.id) == self._settings.telegram_chat_id)
+        return bool(chat and str(chat.id) in self._settings.telegram_chat_ids)
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -83,7 +83,7 @@ class TelegramService:
             message = update.effective_message
             if message is not None:
                 await message.reply_text("🔄 Manual watchlist scan requested. Use /status to follow its progress.")
-            logger.info("manual_scan_requested chat_id=%s", update.effective_chat.id if update.effective_chat else "unknown")
+            logger.info("manual_scan_requested")
         else:
             await query.answer("A scan is already running.", show_alert=False)
 
@@ -126,43 +126,47 @@ class TelegramService:
     async def publish(self, signal: Signal, lifecycle: bool = False, chart_png: bytes | None = None) -> bool:
         text = format_lifecycle(signal) if lifecycle else format_watch(signal) if signal.grade is SignalGrade.WATCH else format_signal(signal)
         if self._settings.dry_run:
-            logger.info("telegram_dry_run symbol=%s strategy=%s score=%d state=%s", signal.symbol, signal.strategy, signal.score, signal.state.value)
+            logger.info(
+                "telegram_dry_run symbol=%s strategy=%s score=%d state=%s recipients=%d",
+                signal.symbol,
+                signal.strategy,
+                signal.score,
+                signal.state.value,
+                len(self._settings.telegram_chat_ids),
+            )
             return True
-        if self._application is None or not self._settings.telegram_chat_id:
+        if self._application is None or not self._settings.telegram_chat_ids:
             logger.error("telegram_failure reason=not_configured")
             return False
-        try:
-            if chart_png and not lifecycle:
-                chart = BytesIO(chart_png)
-                chart.name = f"{signal.symbol.replace('/', '-')}-{signal.strategy.lower()}.png"
-                if len(text) <= 1024:
-                    await self._application.bot.send_photo(
-                        chat_id=self._settings.telegram_chat_id,
-                        photo=chart,
-                        caption=text,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
+        successes = 0
+        for chat_id in self._settings.telegram_chat_ids:
+            try:
+                if chart_png and not lifecycle:
+                    chart = BytesIO(chart_png)
+                    chart.name = f"{signal.symbol.replace('/', '-')}-{signal.strategy.lower()}.png"
+                    if len(text) <= 1024:
+                        await self._application.bot.send_photo(chat_id=chat_id, photo=chart, caption=text, parse_mode=ParseMode.MARKDOWN)
+                    else:
+                        await self._application.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=chart,
+                            caption=f"{signal.symbol} — {signal.direction.value} analysis chart",
+                        )
+                        await self._application.bot.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            disable_web_page_preview=True,
+                        )
                 else:
-                    await self._application.bot.send_photo(
-                        chat_id=self._settings.telegram_chat_id,
-                        photo=chart,
-                        caption=f"{signal.symbol} — {signal.direction.value} analysis chart",
-                    )
                     await self._application.bot.send_message(
-                        chat_id=self._settings.telegram_chat_id,
+                        chat_id=chat_id,
                         text=text,
                         parse_mode=ParseMode.MARKDOWN,
                         disable_web_page_preview=True,
                     )
-            else:
-                await self._application.bot.send_message(
-                    chat_id=self._settings.telegram_chat_id,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
-                )
-            logger.info("telegram_success symbol=%s strategy=%s state=%s", signal.symbol, signal.strategy, signal.state.value)
-            return True
-        except Exception as exc:
-            logger.warning("telegram_failure symbol=%s error=%s", signal.symbol, type(exc).__name__)
-            return False
+                successes += 1
+                logger.info("telegram_success symbol=%s strategy=%s state=%s", signal.symbol, signal.strategy, signal.state.value)
+            except Exception as exc:
+                logger.warning("telegram_failure symbol=%s error=%s", signal.symbol, type(exc).__name__)
+        return successes == len(self._settings.telegram_chat_ids)

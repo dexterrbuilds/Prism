@@ -46,13 +46,17 @@ class Settings:
     zone_atr_tolerance: float
     max_chase_atr: float
     log_level: str
+    telegram_chat_ids: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> Settings:
         candle_limit = min(250, max(220, int(os.getenv("CANDLE_LIMIT", "250"))))
+        primary_chat_id = os.getenv("TELEGRAM_CHAT_ID") or None
+        configured_chat_ids = _csv("TELEGRAM_CHAT_IDS", ())
+        telegram_chat_ids = tuple(dict.fromkeys((primary_chat_id,) + configured_chat_ids)) if primary_chat_id else tuple(dict.fromkeys(configured_chat_ids))
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+            telegram_chat_id=primary_chat_id,
             exchange=os.getenv("EXCHANGE", "binance").lower(),
             watchlist=_csv("WATCHLIST", DEFAULT_WATCHLIST),
             timeframes=("4h", "1h", "15m"),
@@ -70,12 +74,13 @@ class Settings:
             zone_atr_tolerance=max(0.05, float(os.getenv("ZONE_ATR_TOLERANCE", "0.5"))),
             max_chase_atr=max(0.2, float(os.getenv("MAX_CHASE_ATR", "0.75"))),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            telegram_chat_ids=telegram_chat_ids,
         )
 
     def validate(self) -> None:
         if self.exchange not in {"binance", "bybit"}:
             raise ValueError("EXCHANGE must be 'binance' or 'bybit'")
-        if not self.dry_run and (not self.telegram_bot_token or not self.telegram_chat_id):
-            raise ValueError("Telegram credentials are required unless DRY_RUN=true")
+        if not self.dry_run and (not self.telegram_bot_token or not self.telegram_chat_ids):
+            raise ValueError("Telegram token and at least one chat ID are required unless DRY_RUN=true")
         if not self.watchlist:
             raise ValueError("WATCHLIST cannot be empty")

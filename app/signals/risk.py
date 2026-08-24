@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from app.models import Direction, SetupCandidate, SupportResistanceZone, TradePlan
 
 
@@ -48,6 +50,27 @@ def _opposing_levels(zones: tuple[SupportResistanceZone, ...], entry: float, dir
     return sorted((zone for zone in zones if zone.midpoint < entry), key=lambda zone: zone.midpoint, reverse=True)
 
 
+def trade_geometry_valid(plan: TradePlan, direction: Direction) -> bool:
+    values = (
+        plan.entry_zone_low,
+        plan.entry_zone_high,
+        plan.preferred_entry,
+        plan.stop_loss,
+        plan.tp1,
+        plan.tp2,
+        plan.risk_per_unit,
+    )
+    if not all(math.isfinite(value) for value in values):
+        return False
+    if not plan.entry_zone_low <= plan.preferred_entry <= plan.entry_zone_high or plan.risk_per_unit <= 0:
+        return False
+    if direction is Direction.LONG:
+        ordered = plan.stop_loss < plan.preferred_entry < plan.tp1 <= plan.tp2
+        return ordered and (plan.tp3 is None or plan.tp3 > plan.tp2)
+    ordered = plan.stop_loss > plan.preferred_entry > plan.tp1 >= plan.tp2
+    return ordered and (plan.tp3 is None or plan.tp3 < plan.tp2)
+
+
 def build_trade_plan(
     candidate: SetupCandidate,
     current_price: float,
@@ -70,10 +93,17 @@ def build_trade_plan(
     tp2 = two_r_target(preferred, stop, candidate.direction)
     opposing = _opposing_levels(zones, preferred, candidate.direction)
     meaningful = [zone for zone in opposing if zone.score >= 3.0]
-    tp1 = meaningful[0].midpoint if meaningful else (preferred + risk if candidate.direction is Direction.LONG else preferred - risk)
-    tp3 = meaningful[1].midpoint if len(meaningful) > 1 else None
+    if candidate.direction is Direction.LONG:
+        before_tp2 = [zone for zone in meaningful if preferred < zone.midpoint <= tp2]
+        beyond_tp2 = [zone for zone in meaningful if zone.midpoint > tp2 and zone.score >= 5.0]
+        tp1 = before_tp2[0].midpoint if before_tp2 else preferred + risk
+    else:
+        before_tp2 = [zone for zone in meaningful if preferred > zone.midpoint >= tp2]
+        beyond_tp2 = [zone for zone in meaningful if zone.midpoint < tp2 and zone.score >= 5.0]
+        tp1 = before_tp2[0].midpoint if before_tp2 else preferred - risk
+    tp3 = beyond_tp2[0].midpoint if beyond_tp2 else None
     hold_low, hold_high = estimate_hold_time(candidate.strategy, abs(tp2 - preferred) / atr)
-    return TradePlan(
+    plan = TradePlan(
         candidate.ideal_entry_low,
         candidate.ideal_entry_high,
         preferred,
@@ -89,7 +119,11 @@ def build_trade_plan(
         2.0,
         hold_low,
         hold_high,
+        candidate.invalidation_level,
     )
+    if not trade_geometry_valid(plan, candidate.direction):
+        raise RiskPlanningError("invalid direction-aware trade geometry")
+    return plan
 
 
 def room_to_target(plan: TradePlan, zones: tuple[SupportResistanceZone, ...], direction: Direction, minimum_room_r: float = 1.5) -> bool:

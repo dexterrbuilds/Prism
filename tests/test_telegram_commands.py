@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
+
+import pytest
 
 from app.api.health import RuntimeHealth
 from app.config import Settings
 from app.telegram.bot import TelegramService
 from app.telegram.formatter import format_start, format_status
+from tests.test_lifecycle import make_signal
 
 
 def test_start_message_explains_automatic_scan_and_alert_policy(monkeypatch) -> None:
@@ -54,3 +58,42 @@ def test_manual_scan_button_callback_data_is_stable() -> None:
     button = keyboard.inline_keyboard[0][0]
     assert button.text == "🔄 Run Manual Scan"
     assert button.callback_data == "manual_scan"
+
+
+def test_multiple_telegram_recipients_are_deduplicated(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "111")
+    monkeypatch.setenv("TELEGRAM_CHAT_IDS", "111,222,-333")
+    settings = Settings.from_env()
+    assert settings.telegram_chat_ids == ("111", "222", "-333")
+
+
+@pytest.mark.asyncio
+async def test_signal_is_delivered_to_every_configured_recipient(monkeypatch) -> None:
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    settings = replace(
+        Settings.from_env(),
+        dry_run=False,
+        telegram_chat_id="111",
+        telegram_chat_ids=("111", "222"),
+    )
+
+    class RecordingBot:
+        def __init__(self) -> None:
+            self.recipients: list[str] = []
+
+        async def send_message(self, *, chat_id: str, **kwargs: Any) -> None:
+            del kwargs
+            self.recipients.append(chat_id)
+
+    class RecordingApplication:
+        def __init__(self) -> None:
+            self.bot = RecordingBot()
+
+    application = RecordingApplication()
+    service = TelegramService(settings, RuntimeHealth("binance"))
+    service._application = application  # type: ignore[assignment]
+
+    delivered = await service.publish(make_signal(), lifecycle=True)
+
+    assert delivered
+    assert application.bot.recipients == ["111", "222"]

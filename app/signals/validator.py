@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from app.analysis.context import AnalysisContext
 from app.models import Direction, MarketRegime, RejectionReason, SetupCandidate, SignalGrade, TradePlan, VolatilityClass
-from app.signals.risk import is_entry_too_late, room_to_target
+from app.signals.risk import is_entry_too_late, room_to_target, trade_geometry_valid
 from app.signals.scoring import ScoreResult
 
 
@@ -25,6 +25,8 @@ def validate_candidate(
     primary = context.timeframes["1h"]
     price = context.snapshot.series["1h"].latest_close
     atr = float(primary.indicators.atr[-1])
+    if not trade_geometry_valid(plan, candidate.direction):
+        return ValidationResult(False, RejectionReason.POOR_RR)
     if score.total < 70:
         return ValidationResult(False, RejectionReason.LOW_CONFLUENCE)
     if score.total < minimum_valid_score and score.grade is not SignalGrade.WATCH:

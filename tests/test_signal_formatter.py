@@ -18,7 +18,10 @@ def test_signal_format_is_clean_compact_and_chart_caption_safe() -> None:
     assert "🔎 *Why It Qualifies*" in message
     assert "🛑 *Invalidation*" in message
     assert "Supports: Bos Continuation · Ema Pullback" in message
-    assert message.count("•") == 5
+    assert message.count("•") == 4
+    assert "🧮 *$5,000 Margin Example*" in message
+    assert "2× · $10,000 notional" in message
+    assert "5× · $25,000 notional" in message
     assert len(message) <= 1024
 
 

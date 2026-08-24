@@ -240,6 +240,7 @@ class TradePlan:
     reward_risk: float
     estimated_hold_hours_low: float | None = None
     estimated_hold_hours_high: float | None = None
+    invalidation_level: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
