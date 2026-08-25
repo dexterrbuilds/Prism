@@ -103,9 +103,16 @@ class Scanner:
             for symbol, result in zip(self.settings.watchlist, results, strict=True):
                 if isinstance(result, BaseException):
                     failures += 1
-                    error = f"{symbol}: {type(result).__name__}"
+                    detail = str(result).strip()[:240]
+                    error = f"{symbol}: {type(result).__name__}" + (f" - {detail}" if detail else "")
                     errors.append(error)
-                    logger.error("symbol_scan_failure symbol=%s error=%s", symbol, type(result).__name__)
+                    logger.error(
+                        "symbol_scan_failure symbol=%s error=%s message=%s",
+                        symbol,
+                        type(result).__name__,
+                        detail or "none",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
                 elif not result.success:
                     failures += 1
                     if result.error:

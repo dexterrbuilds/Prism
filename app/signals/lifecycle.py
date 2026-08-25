@@ -69,9 +69,19 @@ class SignalStore:
             if signal.symbol != symbol or signal.state not in {SignalState.CONFIRMED, SignalState.ACTIVE, SignalState.TP1_HIT}:
                 continue
             long = signal.direction is Direction.LONG
-            if signal.state is SignalState.CONFIRMED and signal.trade.entry_zone_low <= price <= signal.trade.entry_zone_high:
-                updated = transition(signal, SignalState.ACTIVE)
-            elif (long and price <= signal.trade.stop_loss) or (not long and price >= signal.trade.stop_loss):
+            stop_breached = (long and price <= signal.trade.stop_loss) or (not long and price >= signal.trade.stop_loss)
+
+            # A confirmed setup is not a trade until price is observed inside its
+            # entry zone. Pre-entry failure invalidates the thesis; it must never
+            # be recorded as a stopped position or credited with a target hit.
+            if signal.state is SignalState.CONFIRMED:
+                if signal.trade.entry_zone_low <= price <= signal.trade.entry_zone_high:
+                    updated = transition(signal, SignalState.ACTIVE)
+                elif stop_breached:
+                    updated = transition(signal, SignalState.INVALIDATED)
+                else:
+                    continue
+            elif stop_breached:
                 updated = transition(signal, SignalState.STOPPED)
             elif (long and price >= signal.trade.tp2) or (not long and price <= signal.trade.tp2):
                 updated = transition(signal, SignalState.TP2_HIT)
