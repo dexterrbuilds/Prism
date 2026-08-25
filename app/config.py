@@ -47,6 +47,14 @@ class Settings:
     max_chase_atr: float
     log_level: str
     telegram_chat_ids: tuple[str, ...]
+    telegram_channel_ids: tuple[str, ...]
+    signal_db_path: str
+    signal_history_limit: int
+
+    @property
+    def telegram_delivery_ids(self) -> tuple[str, ...]:
+        """All alert destinations, de-duplicated without broadening command access."""
+        return tuple(dict.fromkeys(self.telegram_chat_ids + self.telegram_channel_ids))
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -54,6 +62,7 @@ class Settings:
         primary_chat_id = os.getenv("TELEGRAM_CHAT_ID") or None
         configured_chat_ids = _csv("TELEGRAM_CHAT_IDS", ())
         telegram_chat_ids = tuple(dict.fromkeys((primary_chat_id,) + configured_chat_ids)) if primary_chat_id else tuple(dict.fromkeys(configured_chat_ids))
+        telegram_channel_ids = tuple(dict.fromkeys(_csv("TELEGRAM_CHANNEL_IDS", ())))
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=primary_chat_id,
@@ -75,12 +84,15 @@ class Settings:
             max_chase_atr=max(0.2, float(os.getenv("MAX_CHASE_ATR", "0.75"))),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             telegram_chat_ids=telegram_chat_ids,
+            telegram_channel_ids=telegram_channel_ids,
+            signal_db_path=os.getenv("SIGNAL_DB_PATH", "/tmp/prism_signals.db"),
+            signal_history_limit=max(100, min(50_000, int(os.getenv("SIGNAL_HISTORY_LIMIT", "5000")))),
         )
 
     def validate(self) -> None:
         if self.exchange not in {"binance", "bybit"}:
             raise ValueError("EXCHANGE must be 'binance' or 'bybit'")
-        if not self.dry_run and (not self.telegram_bot_token or not self.telegram_chat_ids):
-            raise ValueError("Telegram token and at least one chat ID are required unless DRY_RUN=true")
+        if not self.dry_run and (not self.telegram_bot_token or not self.telegram_delivery_ids):
+            raise ValueError("Telegram token and at least one chat or channel destination are required unless DRY_RUN=true")
         if not self.watchlist:
             raise ValueError("WATCHLIST cannot be empty")

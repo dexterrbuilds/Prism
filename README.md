@@ -14,7 +14,7 @@ Trade geometry is validated before publication. LONG plans must satisfy `stop < 
 CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> momentum / volume / volatility / candles / patterns / divergence / liquidity
      -> setup registry -> category-capped score -> risk plan -> strict validator
-     -> bounded lifecycle + dedupe -> Telegram (or DRY_RUN log)
+     -> bounded lifecycle + dedupe -> SQLite outcomes -> Telegram (or DRY_RUN log)
 ```
 
 `FastAPI`, the scanner, and `python-telegram-bot` run concurrently on one asyncio loop. SIGTERM/SIGINT stops Uvicorn and polling, then closes CCXT.
@@ -43,6 +43,7 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `TELEGRAM_BOT_TOKEN` | — | Required when dry-run is false |
 | `TELEGRAM_CHAT_ID` | — | Backward-compatible primary recipient |
 | `TELEGRAM_CHAT_IDS` | — | Comma-separated DM/group recipients; de-duplicated with the primary ID |
+| `TELEGRAM_CHANNEL_IDS` | — | Comma-separated channel destinations: private `-100...` IDs or public `@username` |
 | `EXCHANGE` | `binance` | `binance` USD-M futures or `bybit` linear swaps |
 | `WATCHLIST` | five requested pairs | Comma-separated CCXT symbols |
 | `PORT` | `10000` | Health server port |
@@ -50,6 +51,8 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
+| `SIGNAL_DB_PATH` | `/tmp/prism_signals.db` | SQLite outcome ledger; use a persistent-volume path in production |
+| `SIGNAL_HISTORY_LIMIT` | `5000` | Bounded maximum outcome rows |
 
 The remaining tunables are documented in `.env.example`.
 
@@ -74,13 +77,19 @@ SCAN_INTERVAL_SECONDS=2700
 TELEGRAM_BOT_TOKEN=<BotFather token>
 TELEGRAM_CHAT_ID=<destination chat ID>
 TELEGRAM_CHAT_IDS=<additional ID>,<additional ID>
+TELEGRAM_CHANNEL_IDS=-1001234567890,@public_channel_username
+SIGNAL_DB_PATH=/home/prism/data/prism_signals.db
 ```
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
 
-Initial signal alerts include a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
+Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
+
+TP1 and TP2 alerts include a 1200×675 performance card with achieved R, price move, entry/target/current prices, hold time, and hypothetical `$5,000` margin results at 2× and 5×. Target detection uses closed 15M candle highs/lows rather than only the sampled close. If entry and stop occur in the same candle and their sequence cannot be known, Prism records the conservative filled-then-stopped outcome.
 
 Each configured Telegram recipient receives the same deduplicated alert independently; one failed DM does not prevent delivery to the others. A Telegram user must start the bot first before Telegram permits the bot to initiate that DM.
+
+Channel destinations receive the same chart and signal lifecycle alerts. Add the bot to the channel as an administrator with **Post Messages** permission. Channel destinations are delivery-only: they do not gain access to `/status` or the manual-scan control.
 
 The alert includes hypothetical `$5,000` margin examples at 2× and 5× leverage, showing notional size, approximate base-asset quantity, and linear P/L at stop, TP1, and TP2. These examples exclude fees, funding, slippage, maintenance margin, and liquidation mechanics and are not position-sizing advice.
 
@@ -90,6 +99,7 @@ Signals also include an estimated holding-time range derived from the 1H timefra
 
 - `/start` confirms that Prism is online and displays the exchange, 45-minute cadence, watchlist, and WATCH-alert policy. It does not force an immediate scan or manufacture a signal.
 - `/status` displays scanner state, exchange, delivery mode, cadence, last completed scan, completed-symbol count, and cumulative scan errors.
+- `/stats`, `/stats 7d`, `/stats 30d`, and `/stats all` report persisted results. TP1 is the binary win threshold; a stop before TP1 is a loss, while pre-entry invalidations are excluded.
 - **Run Manual Scan** appears below both command responses. It wakes the normal scanner loop immediately without creating an overlapping scan. If a scan is already running, the request is rejected with a status message.
 
 Commands only respond in configured `TELEGRAM_CHAT_ID` / `TELEGRAM_CHAT_IDS` destinations. The command menu is registered automatically at startup.
@@ -104,6 +114,8 @@ docker run --rm -p 10000:10000 --env-file .env prism-signal-engine
 ## Railway and Render
 
 Railway: create a service from the repository, select the Dockerfile builder, add environment variables, and expose the generated domain. `railway.json` configures `/health`. Use at least one always-on replica if continuous scanning is required; free services that sleep cannot scan while suspended.
+
+For win-rate history across Railway redeploys, attach a persistent volume at `/home/prism/data` and keep `SIGNAL_DB_PATH=/home/prism/data/prism_signals.db`. Without a volume, the Docker filesystem—and therefore SQLite history—can reset on redeployment. Tracking begins when this version first starts; alerts sent before that point cannot be reconstructed automatically.
 
 Render: create a Blueprint from `render.yaml`, add Telegram secrets in the dashboard, and switch `DRY_RUN=false` only after inspecting dry-run output. Free web services may suspend due to inactivity, so continuous operation may require a paid always-on instance or an external health ping permitted by the platform's terms.
 
@@ -120,8 +132,9 @@ The 100-point confluence score caps independent evidence families: trend/regime 
 - Daily/weekly levels are derived from bounded 4H history, so the previous week may be unavailable after large exchange gaps.
 - Trendline detection uses confirmed pivot boundaries rather than discretionary hand-drawn lines.
 - Pattern recognition is intentionally conservative and lightweight; weak geometry returns no pattern.
-- Signal state is memory-only and resets on restart. It is bounded to remain suitable for a 512 MB service.
-- No open interest, funding, liquidation, positioning, execution, or backtest database is included.
+- Open signal state and outcomes are restored from a bounded SQLite ledger when its path is persistent.
+- Live WR is an operational signal statistic, not a historical backtest or calibrated probability. Small samples are explicitly flagged.
+- No open interest, funding, liquidation, positioning, execution, or historical backtest database is included.
 - Free-tier egress, exchange availability, and sleeping policies vary by region/provider.
 
 The expected steady-state application memory is roughly 90–180 MB depending on CCXT/PTB versions and allocator behavior. Candle matrices themselves are tiny (about 180 KB per full five-symbol scan before indicator arrays); caches and signal history are bounded.

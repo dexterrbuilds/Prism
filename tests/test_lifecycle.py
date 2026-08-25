@@ -93,3 +93,42 @@ def test_active_signal_stop_remains_a_stopped_trade() -> None:
     events = store.track_price("BTC/USDT", 94)
 
     assert events[-1].state is SignalState.STOPPED
+
+
+def test_closed_candle_wick_records_tp1_even_when_close_is_below_target() -> None:
+    store = SignalStore()
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    signal = replace(
+        make_signal(state=SignalState.ACTIVE),
+        state_changed_at=started,
+        activated_at=started,
+    )
+    assert store.should_publish(signal)
+
+    events = store.track_candles(
+        "BTC/USDT",
+        [int(started.timestamp() * 1000)],
+        [106],
+        [99],
+        [102],
+    )
+
+    assert events[-1].state is SignalState.TP1_HIT
+    assert events[-1].current_price == 105
+
+
+def test_entry_and_stop_in_same_candle_uses_conservative_loss_ordering() -> None:
+    store = SignalStore()
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    signal = replace(make_signal(state=SignalState.CONFIRMED), state_changed_at=started)
+    assert store.should_publish(signal)
+
+    events = store.track_candles(
+        "BTC/USDT",
+        [int(started.timestamp() * 1000)],
+        [100],
+        [94],
+        [96],
+    )
+
+    assert [event.state for event in events] == [SignalState.ACTIVE, SignalState.STOPPED]

@@ -12,6 +12,7 @@ from app.config import Settings
 from app.exchange.client import ExchangeClient, ExchangeRequestError
 from app.logging_config import configure_logging
 from app.scanner import Scanner
+from app.signals.outcomes import OutcomeLedger
 from app.telegram.bot import TelegramService
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,13 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop_event.set)
     health = RuntimeHealth(settings.exchange)
     exchange = ExchangeClient(settings)
+    outcomes = OutcomeLedger(settings.signal_db_path, settings.signal_history_limit)
+    logger.info("outcome_tracking_started path=%s history_limit=%d", outcomes.path, settings.signal_history_limit)
+    if outcomes.path.startswith("/tmp/"):
+        logger.warning("outcome_tracking_ephemeral path=%s", outcomes.path)
     telegram = TelegramService(settings, health)
-    scanner = Scanner(settings, exchange, telegram, health)
+    telegram.bind_stats(outcomes.stats)
+    scanner = Scanner(settings, exchange, telegram, health, outcomes)
     telegram.bind_manual_scan(scanner.request_manual_scan)
     app = create_app(health)
     server = EmbeddedServer(uvicorn.Config(app, host="0.0.0.0", port=settings.port, log_level=settings.log_level.lower(), access_log=False, log_config=None))
@@ -75,6 +81,7 @@ async def run() -> None:
         except Exception as exc:
             logger.warning("telegram_stop_failure error=%s", type(exc).__name__)
         await exchange.close()
+        outcomes.close()
         logger.info("shutdown_completed")
 
 

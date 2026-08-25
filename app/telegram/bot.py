@@ -12,7 +12,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from app.api.health import RuntimeHealth
 from app.config import Settings
 from app.models import Signal, SignalGrade
-from app.telegram.formatter import format_lifecycle, format_signal, format_start, format_status, format_watch
+from app.signals.outcomes import PerformanceStats
+from app.telegram.formatter import format_lifecycle, format_signal, format_start, format_stats, format_status, format_watch
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +27,19 @@ class TelegramService:
         self._started = False
         self._polling = False
         self._manual_scan_callback: Callable[[], bool] | None = None
+        self._stats_callback: Callable[[int | None], PerformanceStats] | None = None
         if settings.telegram_bot_token:
             self._application = Application.builder().token(settings.telegram_bot_token).build()
             self._application.add_handler(CommandHandler("start", self._handle_start))
             self._application.add_handler(CommandHandler("status", self._handle_status))
+            self._application.add_handler(CommandHandler("stats", self._handle_stats))
             self._application.add_handler(CallbackQueryHandler(self._handle_manual_scan, pattern=r"^manual_scan$"))
 
     def bind_manual_scan(self, callback: Callable[[], bool]) -> None:
         self._manual_scan_callback = callback
+
+    def bind_stats(self, callback: Callable[[int | None], PerformanceStats]) -> None:
+        self._stats_callback = callback
 
     @staticmethod
     def _manual_scan_keyboard() -> InlineKeyboardMarkup:
@@ -63,6 +69,26 @@ class TelegramService:
             format_status(self._settings, self._health),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=self._manual_scan_keyboard(),
+        )
+
+    async def _handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update) or update.effective_message is None:
+            logger.warning("telegram_command_rejected command=stats")
+            return
+        if self._stats_callback is None:
+            await update.effective_message.reply_text("Performance tracking is not ready yet.")
+            return
+        period_days: int | None = None
+        if context.args:
+            value = context.args[0].strip().lower()
+            if value != "all":
+                if not value.endswith("d") or not value[:-1].isdigit() or int(value[:-1]) < 1:
+                    await update.effective_message.reply_text("Usage: /stats, /stats 7d, /stats 30d, or /stats all")
+                    return
+                period_days = min(3650, int(value[:-1]))
+        await update.effective_message.reply_text(
+            format_stats(self._stats_callback(period_days)),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
     async def _handle_manual_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -98,6 +124,7 @@ class TelegramService:
                 (
                     BotCommand("start", "Show bot configuration and usage"),
                     BotCommand("status", "Check scanner and service health"),
+                    BotCommand("stats", "Show tracked signal win rate"),
                 )
             )
         except Exception as exc:
@@ -132,35 +159,37 @@ class TelegramService:
                 signal.strategy,
                 signal.score,
                 signal.state.value,
-                len(self._settings.telegram_chat_ids),
+                len(self._settings.telegram_delivery_ids),
             )
             return True
-        if self._application is None or not self._settings.telegram_chat_ids:
+        destinations = self._settings.telegram_delivery_ids
+        if self._application is None or not destinations:
             logger.error("telegram_failure reason=not_configured")
             return False
         successes = 0
-        for chat_id in self._settings.telegram_chat_ids:
+        for destination in destinations:
             try:
-                if chart_png and not lifecycle:
+                if chart_png:
                     chart = BytesIO(chart_png)
-                    chart.name = f"{signal.symbol.replace('/', '-')}-{signal.strategy.lower()}.png"
+                    suffix = signal.state.value.lower() if lifecycle else signal.strategy.lower()
+                    chart.name = f"{signal.symbol.replace('/', '-')}-{suffix}.png"
                     if len(text) <= 1024:
-                        await self._application.bot.send_photo(chat_id=chat_id, photo=chart, caption=text, parse_mode=ParseMode.MARKDOWN)
+                        await self._application.bot.send_photo(chat_id=destination, photo=chart, caption=text, parse_mode=ParseMode.MARKDOWN)
                     else:
                         await self._application.bot.send_photo(
-                            chat_id=chat_id,
+                            chat_id=destination,
                             photo=chart,
                             caption=f"{signal.symbol} — {signal.direction.value} analysis chart",
                         )
                         await self._application.bot.send_message(
-                            chat_id=chat_id,
+                            chat_id=destination,
                             text=text,
                             parse_mode=ParseMode.MARKDOWN,
                             disable_web_page_preview=True,
                         )
                 else:
                     await self._application.bot.send_message(
-                        chat_id=chat_id,
+                        chat_id=destination,
                         text=text,
                         parse_mode=ParseMode.MARKDOWN,
                         disable_web_page_preview=True,
@@ -169,4 +198,4 @@ class TelegramService:
                 logger.info("telegram_success symbol=%s strategy=%s state=%s", signal.symbol, signal.strategy, signal.state.value)
             except Exception as exc:
                 logger.warning("telegram_failure symbol=%s error=%s", signal.symbol, type(exc).__name__)
-        return successes == len(self._settings.telegram_chat_ids)
+        return successes == len(destinations)

@@ -257,6 +257,10 @@ class Signal:
     evidence: tuple[str, ...]
     created_at: datetime
     supporting_strategies: tuple[str, ...] = ()
+    current_price: float | None = None
+    state_changed_at: datetime | None = None
+    activated_at: datetime | None = None
+    tp1_hit_at: datetime | None = None
 
     @staticmethod
     def utcnow() -> datetime:

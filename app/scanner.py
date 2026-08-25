@@ -14,12 +14,14 @@ from app.config import Settings
 from app.exchange.client import ExchangeClient
 from app.models import Direction, MarketSnapshot, RejectionReason, Signal, SignalGrade, SignalState
 from app.signals.lifecycle import SignalStore
+from app.signals.outcomes import OutcomeLedger
 from app.signals.risk import RiskPlanningError, build_trade_plan
 from app.signals.scoring import score_candidate
 from app.signals.validator import validate_candidate
 from app.strategies import detect_setups
 from app.telegram.bot import TelegramService
 from app.telegram.chart import render_signal_chart
+from app.telegram.pnl_card import render_pnl_card
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +60,23 @@ def select_best_signal(signals: list[Signal], ambiguity_buffer: int = 5) -> Sign
 
 
 class Scanner:
-    def __init__(self, settings: Settings, exchange: ExchangeClient, telegram: TelegramService, health: RuntimeHealth) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        exchange: ExchangeClient,
+        telegram: TelegramService,
+        health: RuntimeHealth,
+        outcomes: OutcomeLedger | None = None,
+    ) -> None:
         self.settings = settings
         self.exchange = exchange
         self.telegram = telegram
         self.health = health
+        self.outcomes = outcomes
         self.store = SignalStore(max_size=128)
+        if outcomes is not None:
+            for signal in outcomes.load_open_signals():
+                self.store.restore(signal)
         self._manual_scan_event = asyncio.Event()
 
     def request_manual_scan(self) -> bool:
@@ -174,7 +187,13 @@ class Scanner:
             signal = Signal(
                 id=sha256(raw_id.encode()).hexdigest()[:20], symbol=symbol, strategy=candidate.strategy,
                 direction=candidate.direction, regime=context.regime, score=score.total, grade=score.grade,
-                state=state, trade=plan, evidence=score.evidence, created_at=datetime.fromtimestamp(as_of_ms / 1000, UTC),
+                state=state,
+                trade=plan,
+                evidence=score.evidence,
+                created_at=datetime.fromtimestamp(as_of_ms / 1000, UTC),
+                current_price=series["15m"].latest_close,
+                state_changed_at=datetime.fromtimestamp(as_of_ms / 1000, UTC),
+                activated_at=datetime.fromtimestamp(as_of_ms / 1000, UTC) if state is SignalState.ACTIVE else None,
             )
             logger.info("signal_confirmed symbol=%s strategy=%s score=%d state=%s", symbol, candidate.strategy, score.total, state.value)
             valid_signals.append(signal)
@@ -190,6 +209,8 @@ class Scanner:
                 len(valid_signals) - 1,
             )
             if self.store.should_publish(selected):
+                if not self.settings.dry_run and self.outcomes is not None:
+                    self.outcomes.record_signal(selected)
                 chart_png: bytes | None = None
                 try:
                     chart_png = render_signal_chart(
@@ -201,7 +222,22 @@ class Scanner:
                 except Exception as exc:
                     logger.warning("chart_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
                 await self.telegram.publish(selected, chart_png=chart_png)
-        for event in self.store.track_price(symbol, series["15m"].latest_close):
+        closed_15m = series["15m"]
+        for event in self.store.track_candles(
+            symbol,
+            closed_15m.timestamp,
+            closed_15m.high,
+            closed_15m.low,
+            closed_15m.close,
+        ):
             logger.info("signal_lifecycle symbol=%s strategy=%s state=%s", event.symbol, event.strategy, event.state.value)
-            await self.telegram.publish(event, lifecycle=True)
+            if not self.settings.dry_run and self.outcomes is not None:
+                self.outcomes.record_event(event)
+            lifecycle_card: bytes | None = None
+            if event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT}:
+                try:
+                    lifecycle_card = render_pnl_card(event)
+                except Exception as exc:
+                    logger.warning("pnl_card_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
+            await self.telegram.publish(event, lifecycle=True, chart_png=lifecycle_card)
         return SymbolScanResult(True)

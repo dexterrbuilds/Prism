@@ -4,10 +4,11 @@ from datetime import UTC, datetime
 from io import BytesIO
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from app.analysis.indicators import IndicatorSet
 from app.models import CandleSeries, Direction, Signal, SupportResistanceZone, ZoneKind
+from app.telegram.fonts import load_font
 
 WIDTH = 1100
 HEIGHT = 700
@@ -17,14 +18,6 @@ PLOT_TOP = 105
 PLOT_BOTTOM = 515
 VOLUME_TOP = 550
 VOLUME_BOTTOM = 635
-
-
-def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-    try:
-        return ImageFont.truetype(name, size)
-    except OSError:
-        return ImageFont.load_default()
 
 
 def _price_text(value: float) -> str:
@@ -69,10 +62,10 @@ def render_signal_chart(
 
     image = Image.new("RGBA", (WIDTH, HEIGHT), "#0b1220")
     draw = ImageDraw.Draw(image)
-    title_font = _font(21, bold=True)
-    subtitle_font = _font(13)
-    axis_font = _font(11)
-    label_font = _font(12, bold=True)
+    title_font = load_font(21, bold=True)
+    subtitle_font = load_font(13)
+    axis_font = load_font(11)
+    label_font = load_font(12, bold=True)
 
     direction_color = "#22c55e" if signal.direction is Direction.LONG else "#ef4444"
     draw.text((PLOT_LEFT, 22), f"{signal.symbol}  ·  1H  ·  {signal.direction.value}", fill=direction_color, font=title_font)
