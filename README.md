@@ -92,7 +92,38 @@ Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL sign
 
 Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
 
-TP1 and TP2 alerts include a 1200×675 performance card with achieved R, price move, entry/target/current prices, hold time, and hypothetical `$5,000` margin results at 2× and 5×. Target detection uses closed 15M candle highs/lows rather than only the sampled close. If entry and stop occur in the same candle and their sequence cannot be known, Prism records the conservative filled-then-stopped outcome.
+TP1, TP2, and pre-TP1 stop alerts include a square performance card with simulated `$5,000` margin PnL at 5×, entry/exit, direction, pair, and hold time. Target detection uses closed 15M candle highs/lows rather than only the sampled close. If entry and stop occur in the same candle and their sequence cannot be known, Prism records the conservative filled-then-stopped outcome.
+
+### Dynamic PnL social cards
+
+Lifecycle results now use a share-ready 1200×1200 PRISM card generator. It separates trade direction from result state, so profitable SHORT, losing SHORT, profitable LONG, and losing LONG cards retain the correct direction color while PnL independently controls positive/negative styling. TP1, TP2, and pre-TP1 stop events render cards; stopped runners are excluded because V1 does not model partial-position allocation after TP1.
+
+The reusable typed API accepts direct trade results and supports entry/exit/mark price, leverage, realized/unrealized PnL, duration, username, quote/context overrides, mascot overrides, configurable mascot thresholds, and actual chart series. When chart data is absent, a deterministic trade-seeded curve is rendered. Runtime generation is local Pillow work—no LLM or network call is used.
+
+```python
+from app.models import Direction
+from app.telegram.pnl_cards import PnlCardData, generate_pnl_card_async
+
+card_png = await generate_pnl_card_async(
+    PnlCardData(
+        pair="SOL/USDT",
+        direction=Direction.LONG,
+        pnl_usd=5_678.90,
+        pnl_percent=32.14,
+        entry_price=142.65,
+        exit_price=151.21,
+        leverage=5,
+    )
+)
+```
+
+Eight bundled PRISM mascot states are selected dynamically: `huge-win`, `big-win`, `win`, `confident`, `loss`, `small-loss`, `neutral`, and `streak`. Generate the six-state development preview with:
+
+```bash
+python -m scripts.generate_pnl_card_demo
+```
+
+Preview PNGs are written to `output/pnl-card-demo/`. Lifecycle cards derived from research signals explicitly display `$5K MARGIN SIMULATION`; direct `PnlCardData` cards do not add that label.
 
 Each configured Telegram recipient receives the same deduplicated alert independently; one failed DM does not prevent delivery to the others. A Telegram user must start the bot first before Telegram permits the bot to initiate that DM.
 

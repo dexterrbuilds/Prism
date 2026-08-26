@@ -254,9 +254,12 @@ class Scanner:
                 logger.info("signal_lifecycle_duplicate_suppressed symbol=%s state=%s", event.symbol, event.state.value)
                 continue
             lifecycle_card: bytes | None = None
-            if event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT}:
+            should_render_pnl = event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT} or (
+                event.state is SignalState.STOPPED and event.tp1_hit_at is None
+            )
+            if should_render_pnl:
                 try:
-                    lifecycle_card = render_pnl_card(event)
+                    lifecycle_card = await asyncio.to_thread(render_pnl_card, event)
                 except Exception as exc:
                     logger.warning("pnl_card_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
             await self.telegram.publish(event, lifecycle=True, chart_png=lifecycle_card)
