@@ -87,10 +87,17 @@ async def test_lifecycle_monitor_emits_entry_only_once(monkeypatch: pytest.Monke
     assert len(entry_events) == 1
 
 
-def _ranked_signal(strategy: str, direction: Direction, score: int, entry: float = 100) -> Signal:
+def _ranked_signal(
+    strategy: str,
+    direction: Direction,
+    score: int,
+    entry: float = 100,
+    *,
+    symbol: str = "BTC/USDT",
+) -> Signal:
     trade = TradePlan(99, 101, entry, "retest", "hold", 95, 5, 2.5, "below structure", 105, 110, None, 2, 8, 20)
     return Signal(
-        strategy, "BTC/USDT", strategy, direction, MarketRegime.BULLISH_TREND,
+        strategy, symbol, strategy, direction, MarketRegime.BULLISH_TREND,
         score, SignalGrade.VALID, SignalState.ACTIVE, trade, ("evidence",),
         datetime.now(UTC),
     )
@@ -107,6 +114,28 @@ def test_overlapping_strategies_collapse_to_one_ranked_thesis() -> None:
     assert selected is not None
     assert selected.strategy == "BREAKOUT_RETEST"
     assert set(selected.supporting_strategies) == {"BOS_CONTINUATION", "BREAKOUT"}
+
+
+def test_each_pair_selects_its_own_best_qualifying_setup() -> None:
+    qualifying = [
+        _ranked_signal("BREAKOUT", Direction.LONG, 82, symbol="BTC/USDT"),
+        _ranked_signal("BREAKOUT_RETEST", Direction.LONG, 91, symbol="BTC/USDT"),
+        _ranked_signal("EMA_PULLBACK", Direction.LONG, 84, symbol="ETH/USDT"),
+        _ranked_signal("BOS_CONTINUATION", Direction.LONG, 88, symbol="ETH/USDT"),
+        _ranked_signal("LIQUIDITY_SWEEP_REVERSAL", Direction.LONG, 86, symbol="SOL/USDT"),
+    ]
+    selected = {
+        symbol: select_best_signal([signal for signal in qualifying if signal.symbol == symbol])
+        for symbol in {signal.symbol for signal in qualifying}
+    }
+
+    assert set(selected) == {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+    assert selected["BTC/USDT"] is not None
+    assert selected["BTC/USDT"].strategy == "BREAKOUT_RETEST"
+    assert selected["ETH/USDT"] is not None
+    assert selected["ETH/USDT"].strategy == "BOS_CONTINUATION"
+    assert selected["SOL/USDT"] is not None
+    assert selected["SOL/USDT"].strategy == "LIQUIDITY_SWEEP_REVERSAL"
 
 
 def test_near_tied_opposite_directions_are_rejected() -> None:
