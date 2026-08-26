@@ -66,9 +66,19 @@ def trade_geometry_valid(plan: TradePlan, direction: Direction) -> bool:
         return False
     if direction is Direction.LONG:
         ordered = plan.stop_loss < plan.preferred_entry < plan.tp1 <= plan.tp2
-        return ordered and (plan.tp3 is None or plan.tp3 > plan.tp2)
+        previous_target = plan.tp3 if plan.tp3 is not None else plan.tp2
+        return (
+            ordered
+            and (plan.tp3 is None or plan.tp3 > plan.tp2)
+            and (plan.tp4 is None or plan.tp4 > previous_target)
+        )
     ordered = plan.stop_loss > plan.preferred_entry > plan.tp1 >= plan.tp2
-    return ordered and (plan.tp3 is None or plan.tp3 < plan.tp2)
+    previous_target = plan.tp3 if plan.tp3 is not None else plan.tp2
+    return (
+        ordered
+        and (plan.tp3 is None or plan.tp3 < plan.tp2)
+        and (plan.tp4 is None or plan.tp4 < previous_target)
+    )
 
 
 def build_trade_plan(

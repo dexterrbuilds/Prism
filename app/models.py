@@ -63,6 +63,15 @@ class VolatilityClass(StrEnum):
 
 
 class SignalState(StrEnum):
+    # Setup lifecycle used by newly published signals.
+    CREATED = "CREATED"
+    WAITING_ENTRY = "WAITING_ENTRY"
+    ENTRY_TRIGGERED = "ENTRY_TRIGGERED"
+    MISSED = "MISSED"
+    SL_HIT = "SL_HIT"
+
+    # Legacy states remain readable so deployments can restore records created
+    # before the setup-lifecycle migration without a destructive data rewrite.
     DETECTED = "DETECTED"
     WATCHING = "WATCHING"
     CONFIRMED = "CONFIRMED"
@@ -241,6 +250,7 @@ class TradePlan:
     estimated_hold_hours_low: float | None = None
     estimated_hold_hours_high: float | None = None
     invalidation_level: float | None = None
+    tp4: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +271,19 @@ class Signal:
     state_changed_at: datetime | None = None
     activated_at: datetime | None = None
     tp1_hit_at: datetime | None = None
+    trading_timeframe: str = "15m"
+    analysis_timeframe: str = "1h"
+    expires_at: datetime | None = None
+    validity_minutes: int | None = None
+    valid_conditions: tuple[str, ...] = ()
+    max_missed_distance: float | None = None
+    entry_trigger_price: float | None = None
+    missed_at: datetime | None = None
+    invalidated_at: datetime | None = None
+    expired_at: datetime | None = None
+    tp2_hit_at: datetime | None = None
+    stopped_at: datetime | None = None
+    lifecycle_reason: str | None = None
 
     @staticmethod
     def utcnow() -> datetime:

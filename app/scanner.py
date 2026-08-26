@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 from app.analysis.context import analyze_snapshot
@@ -13,11 +13,12 @@ from app.api.health import RuntimeHealth
 from app.config import Settings
 from app.exchange.client import ExchangeClient
 from app.models import Direction, MarketSnapshot, RejectionReason, Signal, SignalGrade, SignalState
-from app.signals.lifecycle import SignalStore
+from app.signals.lifecycle import SignalStore, transition
 from app.signals.repository import OutcomeRepository
 from app.signals.risk import RiskPlanningError, build_trade_plan
 from app.signals.scoring import score_candidate
 from app.signals.validator import validate_candidate
+from app.signals.validity import derive_setup_validity_minutes
 from app.strategies import detect_setups
 from app.telegram.bot import TelegramService
 from app.telegram.chart import render_signal_chart
@@ -36,7 +37,14 @@ def select_best_signal(signals: list[Signal], ambiguity_buffer: int = 5) -> Sign
     """Return one ranked thesis; reject near-tied opposite directions."""
     if not signals:
         return None
-    state_priority = {SignalState.ACTIVE: 3, SignalState.CONFIRMED: 2, SignalState.WATCHING: 1}
+    state_priority = {
+        SignalState.ENTRY_TRIGGERED: 4,
+        SignalState.ACTIVE: 4,
+        SignalState.WAITING_ENTRY: 3,
+        SignalState.CONFIRMED: 3,
+        SignalState.CREATED: 2,
+        SignalState.WATCHING: 1,
+    }
     ordered = sorted(signals, key=lambda signal: (signal.score, state_priority.get(signal.state, 0)), reverse=True)
     best_by_direction: dict[Direction, Signal] = {}
     for signal in ordered:
@@ -93,18 +101,74 @@ class Scanner:
         return True
 
     async def _wait_for_next_scan(self, stop_event: asyncio.Event) -> None:
-        stop_task = asyncio.create_task(stop_event.wait())
-        manual_task = asyncio.create_task(self._manual_scan_event.wait())
-        done, pending = await asyncio.wait(
-            {stop_task, manual_task},
-            timeout=self.settings.scan_interval_seconds,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if manual_task in done:
-            self._manual_scan_event.clear()
+        deadline = time.monotonic() + self.settings.scan_interval_seconds
+        while not stop_event.is_set():
+            timeout = min(self.settings.lifecycle_monitor_seconds, max(0.0, deadline - time.monotonic()))
+            if timeout <= 0:
+                return
+            stop_task = asyncio.create_task(stop_event.wait())
+            manual_task = asyncio.create_task(self._manual_scan_event.wait())
+            done, pending = await asyncio.wait(
+                {stop_task, manual_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if stop_task in done:
+                return
+            if manual_task in done:
+                self._manual_scan_event.clear()
+                return
+            await self._monitor_open_setups()
+
+    async def _monitor_open_setups(self) -> None:
+        observed_at = datetime.now(UTC)
+        for expired in self.store.expire_due(observed_at):
+            await self._publish_lifecycle_events([expired], expired.symbol)
+        symbols = self.store.open_symbols()
+        if not symbols:
+            return
+        try:
+            prices = await self.exchange.fetch_prices(symbols)
+        except Exception as exc:
+            logger.warning("lifecycle_price_failure error=%s", type(exc).__name__)
+            return
+        for symbol, price in prices.items():
+            await self._publish_lifecycle_events(
+                self.store.track_price(symbol, price, observed_at=observed_at),
+                symbol,
+            )
+
+    async def _publish_lifecycle_events(self, events: list[Signal], symbol: str) -> None:
+        for event in events:
+            logger.info(
+                "signal_lifecycle symbol=%s strategy=%s state=%s",
+                event.symbol,
+                event.strategy,
+                event.state.value,
+            )
+            publish_event = True
+            if not self.settings.dry_run and self.outcomes is not None:
+                publish_event = await self.outcomes.record_event(event)
+            if not publish_event:
+                logger.info(
+                    "signal_lifecycle_duplicate_suppressed symbol=%s state=%s",
+                    event.symbol,
+                    event.state.value,
+                )
+                continue
+            lifecycle_card: bytes | None = None
+            should_render_pnl = event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT} or (
+                event.state in {SignalState.STOPPED, SignalState.SL_HIT} and event.tp1_hit_at is None
+            )
+            if should_render_pnl:
+                try:
+                    lifecycle_card = await asyncio.to_thread(render_pnl_card, event)
+                except Exception as exc:
+                    logger.warning("pnl_card_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
+            await self.telegram.publish(event, lifecycle=True, chart_png=lifecycle_card)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.health.scanner = "running"
@@ -187,19 +251,41 @@ class Scanner:
             if score.grade is SignalGrade.WATCH and not self.settings.send_watch_alerts:
                 logger.info("watch_suppressed symbol=%s strategy=%s score=%d", symbol, candidate.strategy, score.total)
                 continue
-            in_zone = plan.entry_zone_low <= series["1h"].latest_close <= plan.entry_zone_high
-            state = SignalState.ACTIVE if candidate.confirmed and in_zone else SignalState.CONFIRMED if candidate.confirmed else SignalState.WATCHING
+            state = SignalState.CREATED if candidate.confirmed else SignalState.WATCHING
             raw_id = f"{symbol}|{candidate.strategy}|{candidate.direction.value}|{candidate.detected_at_ms // 3_600_000}"
+            created_at = datetime.fromtimestamp(as_of_ms / 1000, UTC)
+            validity_minutes = derive_setup_validity_minutes(candidate, plan)
+            expires_at = created_at + timedelta(minutes=validity_minutes)
+            atr = float(context.timeframes["1h"].indicators.atr[-1])
+            invalidation_level = plan.invalidation_level or plan.stop_loss
+            relation = "above" if candidate.direction is Direction.LONG else "below"
+            missed_distance = atr * self.settings.max_chase_atr
+            missed_relation = "above" if candidate.direction is Direction.LONG else "below"
+            missed_limit = (
+                plan.entry_zone_high + missed_distance
+                if candidate.direction is Direction.LONG
+                else plan.entry_zone_low - missed_distance
+            )
+            valid_conditions = (
+                f"Price remains {relation} {invalidation_level:.8g}",
+                f"Price does not close {missed_relation} {missed_limit:.8g} before entry",
+                f"Entry triggers before {expires_at.strftime('%H:%M UTC')}",
+            )
             signal = Signal(
                 id=sha256(raw_id.encode()).hexdigest()[:20], symbol=symbol, strategy=candidate.strategy,
                 direction=candidate.direction, regime=context.regime, score=score.total, grade=score.grade,
                 state=state,
                 trade=plan,
                 evidence=score.evidence,
-                created_at=datetime.fromtimestamp(as_of_ms / 1000, UTC),
+                created_at=created_at,
                 current_price=series["15m"].latest_close,
-                state_changed_at=datetime.fromtimestamp(as_of_ms / 1000, UTC),
-                activated_at=datetime.fromtimestamp(as_of_ms / 1000, UTC) if state is SignalState.ACTIVE else None,
+                state_changed_at=created_at,
+                trading_timeframe="15m",
+                analysis_timeframe=candidate.timeframe,
+                expires_at=expires_at,
+                validity_minutes=validity_minutes,
+                valid_conditions=valid_conditions,
+                max_missed_distance=missed_distance,
             )
             logger.info("signal_confirmed symbol=%s strategy=%s score=%d state=%s", symbol, candidate.strategy, score.total, state.value)
             valid_signals.append(signal)
@@ -238,29 +324,42 @@ class Scanner:
                 except Exception as exc:
                     logger.warning("chart_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
                 await self.telegram.publish(selected, chart_png=chart_png)
+                monitored = selected
+                if selected.state is SignalState.CREATED:
+                    monitored = transition(
+                        selected,
+                        SignalState.WAITING_ENTRY,
+                        current_price=selected.current_price,
+                        changed_at=selected.created_at,
+                    )
+                    self.store.restore(monitored)
+                    if not self.settings.dry_run and self.outcomes is not None:
+                        waiting_recorded = await self.outcomes.record_event(monitored)
+                        if not waiting_recorded:
+                            logger.warning(
+                                "setup_waiting_persistence_failure symbol=%s signal_id=%s",
+                                symbol,
+                                selected.id,
+                            )
+                # If publication occurs while price is already inside the zone,
+                # emit exactly one activation event immediately after the setup.
+                await self._publish_lifecycle_events(
+                    self.store.track_price(
+                        symbol,
+                        monitored.current_price or monitored.trade.preferred_entry,
+                        observed_at=monitored.created_at + timedelta(microseconds=1),
+                    ),
+                    symbol,
+                )
         closed_15m = series["15m"]
-        for event in self.store.track_candles(
+        await self._publish_lifecycle_events(
+            self.store.track_candles(
+                symbol,
+                closed_15m.timestamp,
+                closed_15m.high,
+                closed_15m.low,
+                closed_15m.close,
+            ),
             symbol,
-            closed_15m.timestamp,
-            closed_15m.high,
-            closed_15m.low,
-            closed_15m.close,
-        ):
-            logger.info("signal_lifecycle symbol=%s strategy=%s state=%s", event.symbol, event.strategy, event.state.value)
-            publish_event = True
-            if not self.settings.dry_run and self.outcomes is not None:
-                publish_event = await self.outcomes.record_event(event)
-            if not publish_event:
-                logger.info("signal_lifecycle_duplicate_suppressed symbol=%s state=%s", event.symbol, event.state.value)
-                continue
-            lifecycle_card: bytes | None = None
-            should_render_pnl = event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT} or (
-                event.state is SignalState.STOPPED and event.tp1_hit_at is None
-            )
-            if should_render_pnl:
-                try:
-                    lifecycle_card = await asyncio.to_thread(render_pnl_card, event)
-                except Exception as exc:
-                    logger.warning("pnl_card_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
-            await self.telegram.publish(event, lifecycle=True, chart_png=lifecycle_card)
+        )
         return SymbolScanResult(True)

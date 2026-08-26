@@ -57,6 +57,7 @@ class Settings:
     database_pool_min: int
     database_pool_max: int
     database_ssl_require: bool
+    lifecycle_monitor_seconds: float
 
     @property
     def telegram_delivery_ids(self) -> tuple[str, ...]:
@@ -108,6 +109,7 @@ class Settings:
             database_pool_min=database_pool_min,
             database_pool_max=database_pool_max,
             database_ssl_require=_bool("DATABASE_SSL_REQUIRE", True),
+            lifecycle_monitor_seconds=max(15.0, min(900.0, float(os.getenv("LIFECYCLE_MONITOR_SECONDS", "60")))),
         )
 
     def validate(self) -> None:

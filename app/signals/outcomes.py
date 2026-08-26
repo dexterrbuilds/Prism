@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from app.models import Direction, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
-from app.signals.lifecycle import ALLOWED_TRANSITIONS
+from app.signals.lifecycle import (
+    ACTIVE_STATES,
+    ALLOWED_TRANSITIONS,
+    OPEN_STATES,
+    STOP_STATES,
+    WAITING_STATES,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +66,19 @@ def serialize_signal(signal: Signal) -> str:
         "state_changed_at": _iso(signal.state_changed_at),
         "activated_at": _iso(signal.activated_at),
         "tp1_hit_at": _iso(signal.tp1_hit_at),
+        "trading_timeframe": signal.trading_timeframe,
+        "analysis_timeframe": signal.analysis_timeframe,
+        "expires_at": _iso(signal.expires_at),
+        "validity_minutes": signal.validity_minutes,
+        "valid_conditions": list(signal.valid_conditions),
+        "max_missed_distance": signal.max_missed_distance,
+        "entry_trigger_price": signal.entry_trigger_price,
+        "missed_at": _iso(signal.missed_at),
+        "invalidated_at": _iso(signal.invalidated_at),
+        "expired_at": _iso(signal.expired_at),
+        "tp2_hit_at": _iso(signal.tp2_hit_at),
+        "stopped_at": _iso(signal.stopped_at),
+        "lifecycle_reason": signal.lifecycle_reason,
     }
     return json.dumps(data, separators=(",", ":"), allow_nan=False)
 
@@ -83,6 +102,23 @@ def deserialize_signal(raw: str) -> Signal:
         state_changed_at=_datetime(data.get("state_changed_at")),
         activated_at=_datetime(data.get("activated_at")),
         tp1_hit_at=_datetime(data.get("tp1_hit_at")),
+        trading_timeframe=str(data.get("trading_timeframe", "15m")),
+        analysis_timeframe=str(data.get("analysis_timeframe", "1h")),
+        expires_at=_datetime(data.get("expires_at")),
+        validity_minutes=int(data["validity_minutes"]) if data.get("validity_minutes") is not None else None,
+        valid_conditions=tuple(str(item) for item in data.get("valid_conditions", ())),
+        max_missed_distance=(
+            float(data["max_missed_distance"]) if data.get("max_missed_distance") is not None else None
+        ),
+        entry_trigger_price=(
+            float(data["entry_trigger_price"]) if data.get("entry_trigger_price") is not None else None
+        ),
+        missed_at=_datetime(data.get("missed_at")),
+        invalidated_at=_datetime(data.get("invalidated_at")),
+        expired_at=_datetime(data.get("expired_at")),
+        tp2_hit_at=_datetime(data.get("tp2_hit_at")),
+        stopped_at=_datetime(data.get("stopped_at")),
+        lifecycle_reason=str(data["lifecycle_reason"]) if data.get("lifecycle_reason") else None,
     )
 
 
@@ -123,6 +159,11 @@ class OutcomeLedger:
                 tp2_hit_at TEXT,
                 stopped_at TEXT,
                 invalidated_at TEXT,
+                expires_at TEXT,
+                entry_trigger_price REAL,
+                missed_at TEXT,
+                expired_at TEXT,
+                lifecycle_reason TEXT,
                 win INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             );
@@ -130,6 +171,22 @@ class OutcomeLedger:
             CREATE INDEX IF NOT EXISTS idx_signal_outcomes_state ON signal_outcomes(state);
             """
         )
+        existing_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(signal_outcomes)").fetchall()
+        }
+        migrations = {
+            "expires_at": "TEXT",
+            "entry_trigger_price": "REAL",
+            "missed_at": "TEXT",
+            "expired_at": "TEXT",
+            "lifecycle_reason": "TEXT",
+        }
+        for column, column_type in migrations.items():
+            if column not in existing_columns:
+                self._connection.execute(
+                    f"ALTER TABLE signal_outcomes ADD COLUMN {column} {column_type}"  # noqa: S608 - fixed migration map
+                )
         self._connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('tracking_started_at', ?)",
             (_iso(datetime.now(UTC)),),
@@ -145,13 +202,14 @@ class OutcomeLedger:
 
     def record_signal(self, signal: Signal) -> bool:
         now = signal.state_changed_at or signal.created_at
-        activated_at = _iso(signal.activated_at or now) if signal.state is SignalState.ACTIVE else _iso(signal.activated_at)
+        activated_at = _iso(signal.activated_at or now) if signal.state in ACTIVE_STATES else _iso(signal.activated_at)
         cursor = self._connection.execute(
             """
             INSERT OR IGNORE INTO signal_outcomes(
                 signal_id, created_at, updated_at, state, symbol, strategy,
-                direction, score, current_price, activated_at, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                direction, score, current_price, activated_at, expires_at,
+                entry_trigger_price, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -164,6 +222,8 @@ class OutcomeLedger:
                 signal.score,
                 signal.current_price,
                 activated_at,
+                _iso(signal.expires_at),
+                signal.entry_trigger_price,
                 serialize_signal(signal),
             ),
         )
@@ -186,14 +246,32 @@ class OutcomeLedger:
         event_at = signal.state_changed_at or datetime.now(UTC)
         fields: dict[SignalState, tuple[str, ...]] = {
             SignalState.ACTIVE: ("activated_at",),
+            SignalState.ENTRY_TRIGGERED: ("activated_at",),
             SignalState.TP1_HIT: ("tp1_hit_at",),
             SignalState.TP2_HIT: ("tp1_hit_at", "tp2_hit_at"),
             SignalState.STOPPED: ("stopped_at",),
+            SignalState.SL_HIT: ("stopped_at",),
+            SignalState.MISSED: ("missed_at",),
             SignalState.INVALIDATED: ("invalidated_at",),
+            SignalState.EXPIRED: ("expired_at",),
         }
         timestamp_fields = fields.get(signal.state, ())
-        assignments = ["updated_at = ?", "state = ?", "current_price = ?", "payload = ?"]
-        values: list[Any] = [_iso(event_at), signal.state.value, signal.current_price, serialize_signal(signal)]
+        assignments = [
+            "updated_at = ?",
+            "state = ?",
+            "current_price = ?",
+            "entry_trigger_price = COALESCE(entry_trigger_price, ?)",
+            "lifecycle_reason = ?",
+            "payload = ?",
+        ]
+        values: list[Any] = [
+            _iso(event_at),
+            signal.state.value,
+            signal.current_price,
+            signal.entry_trigger_price,
+            signal.lifecycle_reason,
+            serialize_signal(signal),
+        ]
         for field in timestamp_fields:
             assignments.append(f"{field} = COALESCE({field}, ?)")
             values.append(_iso(event_at))
@@ -208,9 +286,11 @@ class OutcomeLedger:
         return inserted or existing is not None
 
     def load_open_signals(self) -> tuple[Signal, ...]:
+        open_values = tuple(state.value for state in OPEN_STATES)
+        placeholders = ", ".join("?" for _ in open_values)
         rows = self._connection.execute(
-            "SELECT payload FROM signal_outcomes WHERE state IN (?, ?, ?)",
-            (SignalState.CONFIRMED.value, SignalState.ACTIVE.value, SignalState.TP1_HIT.value),
+            f"SELECT payload FROM signal_outcomes WHERE state IN ({placeholders})",  # noqa: S608 - generated placeholders
+            open_values,
         ).fetchall()
         signals: list[Signal] = []
         for row in rows:
@@ -237,7 +317,7 @@ class OutcomeLedger:
             (_iso(cutoff),),
         ).fetchall()
         wins = sum(int(row["win"]) for row in rows)
-        losses = sum(row["state"] == SignalState.STOPPED.value and not int(row["win"]) for row in rows)
+        losses = sum(row["state"] in {state.value for state in STOP_STATES} and not int(row["win"]) for row in rows)
         durations: list[float] = []
         for row in rows:
             activated = _datetime(row["activated_at"])
@@ -251,10 +331,18 @@ class OutcomeLedger:
             activated=sum(row["activated_at"] is not None for row in rows),
             wins=wins,
             losses=losses,
-            open_signals=sum(row["state"] in {SignalState.CONFIRMED.value, SignalState.ACTIVE.value} for row in rows),
+            open_signals=sum(row["state"] in {state.value for state in WAITING_STATES | ACTIVE_STATES} for row in rows),
             tp1_runners=sum(row["state"] == SignalState.TP1_HIT.value for row in rows),
             tp2_hits=sum(row["tp2_hit_at"] is not None for row in rows),
-            invalidated=sum(row["invalidated_at"] is not None for row in rows),
+            invalidated=sum(
+                row["state"]
+                in {
+                    SignalState.INVALIDATED.value,
+                    SignalState.MISSED.value,
+                    SignalState.EXPIRED.value,
+                }
+                for row in rows
+            ),
             average_hold_hours=sum(durations) / len(durations) if durations else None,
         )
 
@@ -266,6 +354,8 @@ class OutcomeLedger:
         terminal = (
             SignalState.TP2_HIT.value,
             SignalState.STOPPED.value,
+            SignalState.SL_HIT.value,
+            SignalState.MISSED.value,
             SignalState.INVALIDATED.value,
             SignalState.EXPIRED.value,
         )
@@ -273,7 +363,7 @@ class OutcomeLedger:
             """
             DELETE FROM signal_outcomes WHERE signal_id IN (
                 SELECT signal_id FROM signal_outcomes
-                WHERE state IN (?, ?, ?, ?) ORDER BY created_at ASC LIMIT ?
+                WHERE state IN (?, ?, ?, ?, ?, ?) ORDER BY created_at ASC LIMIT ?
             )
             """,
             (*terminal, excess),

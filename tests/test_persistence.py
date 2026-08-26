@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 from app.config import Settings
 from app.models import SignalState
 from app.signals.lifecycle import transition
+from app.signals.outcomes import OutcomeLedger
 from app.signals.postgres_outcomes import PostgresOutcomeRepository
 from app.signals.repository import SQLiteOutcomeRepository
 from tests.test_lifecycle import make_signal
@@ -27,6 +29,38 @@ def test_explicit_postgres_requires_database_url(monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("DATABASE_URL", raising=False)
     with pytest.raises(ValueError, match="DATABASE_URL"):
         Settings.from_env().validate()
+
+
+def test_lifecycle_monitor_cadence_is_environment_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIFECYCLE_MONITOR_SECONDS", "45")
+    settings = Settings.from_env()
+    assert settings.lifecycle_monitor_seconds == 45
+
+
+def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE signal_outcomes (
+            signal_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            state TEXT NOT NULL, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+            direction TEXT NOT NULL, score INTEGER NOT NULL, current_price REAL,
+            activated_at TEXT, tp1_hit_at TEXT, tp2_hit_at TEXT, stopped_at TEXT,
+            invalidated_at TEXT, win INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    ledger = OutcomeLedger(str(path))
+    migrated = sqlite3.connect(path)
+    columns = {row[1] for row in migrated.execute("PRAGMA table_info(signal_outcomes)")}
+    migrated.close()
+    ledger.close()
+
+    assert {"expires_at", "entry_trigger_price", "missed_at", "expired_at", "lifecycle_reason"} <= columns
 
 
 @pytest.mark.asyncio

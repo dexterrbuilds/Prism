@@ -35,54 +35,88 @@ def _hold_time(signal: Signal) -> str:
     return f"{hours:.1f}h"
 
 
+def _duration(minutes: int | None) -> str:
+    if minutes is None:
+        return "Not configured"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} HOUR" if hours == 1 else f"{hours} HOURS"
+    if minutes > 60:
+        return f"{minutes // 60}H {minutes % 60}M"
+    return f"{minutes} MINUTES"
+
+
+def _elapsed(signal: Signal) -> str:
+    event_at = signal.state_changed_at or signal.created_at
+    seconds = max(0.0, (event_at - signal.created_at).total_seconds())
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes / 60:.1f}h"
+
+
+def _expiry(signal: Signal) -> str:
+    if signal.expires_at is None:
+        return "Not configured"
+    return signal.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _targets(signal: Signal) -> str:
+    lines = [
+        f"TP1: {_price(signal.trade.tp1)}",
+        f"TP2: {_price(signal.trade.tp2)} · 2R",
+    ]
+    if signal.trade.tp3 is not None:
+        lines.append(f"TP3: {_price(signal.trade.tp3)}")
+    if signal.trade.tp4 is not None:
+        lines.append(f"TP4: {_price(signal.trade.tp4)}")
+    return "\n".join(lines)
+
+
 def format_signal(signal: Signal) -> str:
-    icon = "🟢" if signal.direction is Direction.LONG else "🔴"
-    evidence = "\n".join(f"• {item[:64]}" for item in signal.evidence[:4])
+    evidence = "\n".join(f"• {item[:60]}" for item in signal.evidence[:3])
     strategy = signal.strategy.replace("_", " ").title()
     supporting = ""
     if signal.supporting_strategies:
         names = " · ".join(name.replace("_", " ").title() for name in signal.supporting_strategies[:2])
         supporting = f"\nSupports: {names}"
-    hold_time = "Not calibrated"
-    if signal.trade.estimated_hold_hours_low is not None and signal.trade.estimated_hold_hours_high is not None:
-        hold_time = f"{signal.trade.estimated_hold_hours_low:g}–{signal.trade.estimated_hold_hours_high:g}h"
-    invalidation = signal.trade.invalidation_reason
-    if signal.trade.invalidation_level is not None:
-        relation = "below" if signal.direction is Direction.LONG else "above"
-        invalidation = f"1H close {relation} {_price(signal.trade.invalidation_level)}"
     base_asset = signal.symbol.split("/", maxsplit=1)[0]
     simulations = [simulate_leverage(signal, 5_000, leverage) for leverage in (2, 5)]
     simulation_text = "\n".join(
         (
-            f"{item.leverage}× · ${item.notional_usd:,.0f} notional · {item.quantity:.4f} {base_asset}\n"
-            f"SL {_signed_money(item.stop_pnl_usd)} · TP1 {_signed_money(item.tp1_pnl_usd)} · TP2 {_signed_money(item.tp2_pnl_usd)}"
+            f"{item.leverage}× ${item.notional_usd:,.0f} · {item.quantity:.4f} {base_asset} · "
+            f"SL {_signed_money(item.stop_pnl_usd)} / TP1 {_signed_money(item.tp1_pnl_usd)} / TP2 {_signed_money(item.tp2_pnl_usd)}"
         )
         for item in simulations
     )
-    tp3_line = f"TP3: {_price(signal.trade.tp3)}\n" if signal.trade.tp3 is not None else ""
+    conditions = "\n".join(f"• {condition[:78]}" for condition in signal.valid_conditions[:3])
+    if not conditions:
+        conditions = f"• {signal.trade.invalidation_reason[:78]}"
+    invalidation_level = signal.trade.invalidation_level or signal.trade.stop_loss
     return (
-        f"{icon} *{signal.symbol} · {signal.direction.value}*\n"
-        f"*{strategy}* · {signal.grade.value}\n"
-        f"{signal.regime.value.replace('_', ' ').title()} · Confluence {signal.score}/100"
+        f"🚨 *{signal.symbol} · {signal.direction.value}*\n"
+        "*SETUP DETECTED · LIVE SETUP*\n"
+        f"{strategy} · {signal.grade.value} · Confluence {signal.score}/100"
         f"{supporting}\n\n"
-        f"💹 *Current Price*\n{_price(_current_price(signal))} · latest closed 15M candle\n\n"
-        "⚡ *Entry Trigger*\n"
-        f"{signal.trade.trigger[:160]}\n\n"
-        "🎯 *Trade Plan*\n"
-        f"Entry: {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
+        f"📍 *Current Price*  {_price(_current_price(signal))}\n\n"
+        "🎯 *ENTRY*\n"
+        f"{_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
         f"Preferred: {_price(signal.trade.preferred_entry)}\n"
-        f"Stop: {_price(signal.trade.stop_loss)}\n"
-        f"TP1: {_price(signal.trade.tp1)}\n"
-        f"TP2 (2R): {_price(signal.trade.tp2)}\n"
-        f"{tp3_line}"
-        f"R:R  1:{signal.trade.reward_risk:.2f} · Hold estimate {hold_time}\n\n"
-        "🔎 *Why It Qualifies*\n"
-        f"{evidence}\n\n"
-        "🧮 *$5,000 Margin Example*\n"
+        f"Trigger: {signal.trade.trigger[:100]}\n\n"
+        f"🛡 *INVALIDATION*  {_price(invalidation_level)}\n"
+        f"{signal.trade.invalidation_reason[:100]}\n\n"
+        f"🎯 *TARGETS*\n{_targets(signal)}\n"
+        f"R:R 1:{signal.trade.reward_risk:.2f}\n\n"
+        f"📊 *Setup*  {strategy}\n"
+        f"⏱ *Timeframe*  Trade {signal.trading_timeframe.upper()} · Analysis {signal.analysis_timeframe.upper()}\n"
+        f"⏳ *SETUP VALID FOR: {_duration(signal.validity_minutes)}*\n"
+        f"🕐 *EXPIRES: {_expiry(signal)}*\n\n"
+        f"✅ *VALID WHILE*\n{conditions}\n\n"
+        f"🔎 *Confluence*\n{evidence}\n\n"
+        "🧮 *$5K Margin Simulation*\n"
         f"{simulation_text}\n\n"
-        "🛑 *Invalidation*\n"
-        f"{invalidation}\n\n"
-        "⚠️ Research example only. Excludes fees, funding, slippage and liquidation mechanics."
+        "⚡ *Waiting for entry…*\n"
+        "_Research only · fees, funding and slippage excluded._"
     )
 
 
@@ -93,7 +127,8 @@ def format_watch(signal: Signal) -> str:
         f"💹 *Current Price*\n{_price(_current_price(signal))} · latest closed 15M candle\n\n"
         "🔎 *Confirmation Needed*\n"
         f"{signal.trade.trigger}\n\n"
-        f"🛑 *Invalidation*\n{_price(signal.trade.stop_loss)}"
+        f"🛑 *Invalidation*\n{_price(signal.trade.invalidation_level or signal.trade.stop_loss)}\n"
+        f"⏳ Valid for {_duration(signal.validity_minutes)} · Expires {_expiry(signal)}"
     )
 
 
@@ -104,17 +139,22 @@ def format_lifecycle(signal: Signal) -> str:
     if signal.direction is Direction.SHORT:
         move *= -1
     timestamp = (signal.state_changed_at or signal.created_at).astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    if signal.state.value == "ACTIVE":
+    if signal.state.value in {"ACTIVE", "ENTRY_TRIGGERED"}:
+        trigger_price = signal.entry_trigger_price or price
         return (
-            f"🚀 *ENTRY TRIGGERED · {signal.symbol}*\n"
-            f"{signal.direction.value} · {strategy}\n\n"
-            f"*Current Price*  {_price(price)}\n"
+            "🟢 *ENTRY TRIGGERED*\n"
+            f"*{signal.symbol} · {signal.direction.value}*\n"
+            "Status: *ACTIVE*\n\n"
+            f"📍 *Current Price*  {_price(price)}\n"
+            f"*Actual Trigger*  {_price(trigger_price)}\n"
             f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
-            f"*Preferred*  {_price(signal.trade.preferred_entry)}\n\n"
-            "⚡ *Trigger Confirmed*\n"
-            f"{signal.trade.trigger[:180]}\n\n"
-            f"🛡 Stop {_price(signal.trade.stop_loss)} · 🎯 TP1 {_price(signal.trade.tp1)} · TP2 {_price(signal.trade.tp2)}\n"
-            f"{timestamp}"
+            f"*Preferred Entry*  {_price(signal.trade.preferred_entry)}\n\n"
+            f"🛡 *SL*  {_price(signal.trade.stop_loss)}\n"
+            f"🎯 *TP1*  {_price(signal.trade.tp1)} · *TP2*  {_price(signal.trade.tp2)}\n"
+            f"*Risk : Reward*  1:{signal.trade.reward_risk:.2f}\n\n"
+            f"📊 {strategy} · {signal.trading_timeframe.upper()} trade / {signal.analysis_timeframe.upper()} analysis\n"
+            f"⏱ Triggered {_elapsed(signal)} after setup creation\n"
+            f"🕐 {timestamp}"
         )
     if signal.state.value in {"TP1_HIT", "TP2_HIT"}:
         tp2 = signal.state.value == "TP2_HIT"
@@ -133,7 +173,7 @@ def format_lifecycle(signal: Signal) -> str:
             f"{timestamp}\n\n"
             "_TP1 is counted as a win in Prism statistics._"
         )
-    if signal.state.value == "STOPPED":
+    if signal.state.value in {"STOPPED", "SL_HIT"}:
         won = signal.tp1_hit_at is not None
         return (
             f"🛑 *{'RUNNER CLOSED' if won else 'STOP LOSS HIT'}*\n"
@@ -143,14 +183,39 @@ def format_lifecycle(signal: Signal) -> str:
             f"*Outcome*  {'TP1 win remains recorded' if won else 'Loss recorded'}\n"
             f"*Hold*  {_hold_time(signal)} · {timestamp}"
         )
-    icons = {"INVALIDATED": "⚠️", "EXPIRED": "⌛"}
-    icon = icons.get(signal.state.value, "ℹ️")
-    counted = "Not counted in win rate" if signal.state.value in {"INVALIDATED", "EXPIRED"} else "Lifecycle update"
-    return (
-        f"{icon} *{signal.symbol} · {signal.direction.value}*\n"
-        f"{signal.state.value.replace('_', ' ').title()} · {strategy}\n"
-        f"Current {_price(price)} · {counted}"
-    )
+    reason = signal.lifecycle_reason or "The setup is no longer actionable."
+    if signal.state.value == "MISSED":
+        return (
+            "⚪ *SETUP MISSED*\n"
+            f"*{signal.symbol} · {signal.direction.value}*\n\n"
+            f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
+            f"*Current Price*  {_price(price)}\n\n"
+            f"*Reason*\n{reason}\n\n"
+            "_No trade was activated. Not counted in win rate._"
+        )
+    if signal.state.value == "INVALIDATED":
+        return (
+            "🔴 *SETUP INVALIDATED*\n"
+            f"*{signal.symbol} · {signal.direction.value}*\n\n"
+            f"*Setup*  {strategy}\n"
+            f"*Current Price*  {_price(price)}\n"
+            f"*Invalidation Level*  {_price(signal.trade.invalidation_level or signal.trade.stop_loss)}\n\n"
+            f"*Reason*\n{reason}\n\n"
+            "_The setup is no longer actionable. Not counted in win rate._"
+        )
+    if signal.state.value == "EXPIRED":
+        return (
+            "⏰ *SETUP EXPIRED*\n"
+            f"*{signal.symbol} · {signal.direction.value}* · {strategy}\n\n"
+            f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
+            f"*Current Price*  {_price(price)}\n"
+            f"*Created*  {signal.created_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"*Expiry*  {_expiry(signal)}\n"
+            f"*Duration*  {_duration(signal.validity_minutes)}\n\n"
+            f"*Reason*\n{reason}\n\n"
+            "_No trade was activated. Not counted in win rate._"
+        )
+    return f"ℹ️ *{signal.symbol} · {signal.direction.value}*\n{signal.state.value.replace('_', ' ').title()} · {strategy}"
 
 
 def format_stats(stats: PerformanceStats) -> str:
@@ -167,7 +232,7 @@ def format_stats(stats: PerformanceStats) -> str:
         f"*Activated*  {stats.activated} of {stats.signals} tracked signals\n"
         f"*TP2 Extensions*  {stats.tp2_hits}\n"
         f"*Open / TP1 Runners*  {stats.open_signals} / {stats.tp1_runners}\n"
-        f"*Pre-entry Invalidations*  {stats.invalidated}\n"
+        f"*Pre-entry Closures*  {stats.invalidated}\n"
         f"*Average Time to Outcome*  {average_hold}"
         f"{sample_note}"
     )

@@ -28,7 +28,7 @@ def pnl_card_data_from_signal(
         exit_price = signal.trade.tp2
     elif signal.state is SignalState.TP1_HIT:
         exit_price = signal.trade.tp1
-    elif signal.state is SignalState.STOPPED and signal.tp1_hit_at is None:
+    elif signal.state in {SignalState.STOPPED, SignalState.SL_HIT} and signal.tp1_hit_at is None:
         exit_price = signal.trade.stop_loss
     else:
         raise ValueError("PnL cards require TP1, TP2, or a pre-TP1 stop event")

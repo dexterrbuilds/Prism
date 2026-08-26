@@ -102,6 +102,14 @@ def test_pre_tp1_stop_generates_a_premium_loss_card() -> None:
         assert image.size == (1200, 1200)
 
 
+def test_new_sl_hit_state_generates_a_premium_loss_card() -> None:
+    stopped = replace(make_signal(state=SignalState.SL_HIT), current_price=95, tp1_hit_at=None)
+    data = pnl_card_data_from_signal(stopped)
+    assert data.pnl_usd < 0
+    with Image.open(BytesIO(render_pnl_card(stopped))) as image:
+        assert image.size == (1200, 1200)
+
+
 def test_generic_generator_handles_large_values_custom_chart_and_pair() -> None:
     payload = generate_pnl_card(
         PnlCardData(

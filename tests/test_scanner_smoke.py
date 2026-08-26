@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -25,6 +26,9 @@ class FakeExchange:
 
     def clear_cycle_cache(self) -> None:
         pass
+
+    async def fetch_prices(self, symbols: tuple[str, ...]) -> dict[str, float]:
+        return {symbol: 100.0 for symbol in symbols}
 
 
 class FakeTelegram:
@@ -58,6 +62,29 @@ def test_manual_scan_request_is_queued_once_and_never_overlaps(monkeypatch: pyte
     health.scanner = "running"
     scanner._manual_scan_event.clear()
     assert not scanner.request_manual_scan()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_monitor_emits_entry_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DRY_RUN", "true")
+    telegram = FakeTelegram()
+    scanner = Scanner(Settings.from_env(), FakeExchange(), telegram, RuntimeHealth("fake"))  # type: ignore[arg-type]
+    from tests.test_lifecycle import make_waiting_signal
+
+    now = datetime.now(UTC)
+    scanner.store.restore(
+        replace(
+            make_waiting_signal(),
+            created_at=now - timedelta(minutes=1),
+            state_changed_at=now - timedelta(minutes=1),
+            expires_at=now + timedelta(hours=6),
+        )
+    )
+    await scanner._monitor_open_setups()
+    await scanner._monitor_open_setups()
+
+    entry_events = [signal for signal in telegram.signals if signal.state is SignalState.ENTRY_TRIGGERED]
+    assert len(entry_events) == 1
 
 
 def _ranked_signal(strategy: str, direction: Direction, score: int, entry: float = 100) -> Signal:

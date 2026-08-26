@@ -7,7 +7,13 @@ from typing import Any
 import asyncpg  # type: ignore[import-untyped]
 
 from app.models import Signal, SignalState
-from app.signals.lifecycle import ALLOWED_TRANSITIONS
+from app.signals.lifecycle import (
+    ACTIVE_STATES,
+    ALLOWED_TRANSITIONS,
+    OPEN_STATES,
+    STOP_STATES,
+    WAITING_STATES,
+)
 from app.signals.outcomes import PerformanceStats, deserialize_signal, serialize_signal
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -95,6 +101,11 @@ class PostgresOutcomeRepository:
                     tp2_hit_at TIMESTAMPTZ,
                     stopped_at TIMESTAMPTZ,
                     invalidated_at TIMESTAMPTZ,
+                    expires_at TIMESTAMPTZ,
+                    entry_trigger_price DOUBLE PRECISION,
+                    missed_at TIMESTAMPTZ,
+                    expired_at TIMESTAMPTZ,
+                    lifecycle_reason TEXT,
                     win BOOLEAN NOT NULL DEFAULT FALSE,
                     payload JSONB NOT NULL
                 );
@@ -102,6 +113,16 @@ class PostgresOutcomeRepository:
                     ON {self._outcomes}(created_at);
                 CREATE INDEX IF NOT EXISTS idx_prism_outcomes_state
                     ON {self._outcomes}(state);
+                """
+            )
+            await connection.execute(
+                f"""
+                ALTER TABLE {self._outcomes}
+                    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS entry_trigger_price DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS missed_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS expired_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS lifecycle_reason TEXT
                 """
             )
             await connection.execute(
@@ -115,13 +136,14 @@ class PostgresOutcomeRepository:
 
     async def _insert_signal(self, connection: asyncpg.Connection, signal: Signal) -> bool:
         now = signal.state_changed_at or signal.created_at
-        activated_at = signal.activated_at or (now if signal.state is SignalState.ACTIVE else None)
+        activated_at = signal.activated_at or (now if signal.state in ACTIVE_STATES else None)
         result: str = await connection.execute(
             f"""
             INSERT INTO {self._outcomes}(
                 signal_id, created_at, updated_at, state, symbol, strategy,
-                direction, score, current_price, activated_at, payload
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+                direction, score, current_price, activated_at, expires_at,
+                entry_trigger_price, payload
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
             ON CONFLICT (signal_id) DO NOTHING
             """,
             signal.id,
@@ -134,6 +156,8 @@ class PostgresOutcomeRepository:
             signal.score,
             signal.current_price,
             activated_at,
+            signal.expires_at,
+            signal.entry_trigger_price,
             serialize_signal(signal),
         )
         return result == "INSERT 0 1"
@@ -162,13 +186,32 @@ class PostgresOutcomeRepository:
             event_at = signal.state_changed_at or datetime.now(UTC)
             timestamp_fields: dict[SignalState, tuple[str, ...]] = {
                 SignalState.ACTIVE: ("activated_at",),
+                SignalState.ENTRY_TRIGGERED: ("activated_at",),
                 SignalState.TP1_HIT: ("tp1_hit_at",),
                 SignalState.TP2_HIT: ("tp1_hit_at", "tp2_hit_at"),
                 SignalState.STOPPED: ("stopped_at",),
+                SignalState.SL_HIT: ("stopped_at",),
+                SignalState.MISSED: ("missed_at",),
                 SignalState.INVALIDATED: ("invalidated_at",),
+                SignalState.EXPIRED: ("expired_at",),
             }
-            assignments = ["updated_at = $2", "state = $3", "current_price = $4", "payload = $5::jsonb"]
-            values: list[Any] = [signal.id, event_at, signal.state.value, signal.current_price, serialize_signal(signal)]
+            assignments = [
+                "updated_at = $2",
+                "state = $3",
+                "current_price = $4",
+                "entry_trigger_price = COALESCE(entry_trigger_price, $5)",
+                "lifecycle_reason = $6",
+                "payload = $7::jsonb",
+            ]
+            values: list[Any] = [
+                signal.id,
+                event_at,
+                signal.state.value,
+                signal.current_price,
+                signal.entry_trigger_price,
+                signal.lifecycle_reason,
+                serialize_signal(signal),
+            ]
             for field in timestamp_fields.get(signal.state, ()):
                 values.append(event_at)
                 assignments.append(f"{field} = COALESCE({field}, ${len(values)})")
@@ -184,7 +227,7 @@ class PostgresOutcomeRepository:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 f"SELECT payload::text AS payload FROM {self._outcomes} WHERE state = ANY($1::text[])",
-                [SignalState.CONFIRMED.value, SignalState.ACTIVE.value, SignalState.TP1_HIT.value],
+                [state.value for state in OPEN_STATES],
             )
         signals: list[Signal] = []
         for row in rows:
@@ -212,7 +255,7 @@ class PostgresOutcomeRepository:
                 cutoff,
             )
         wins = sum(bool(row["win"]) for row in rows)
-        losses = sum(row["state"] == SignalState.STOPPED.value and not bool(row["win"]) for row in rows)
+        losses = sum(row["state"] in {state.value for state in STOP_STATES} and not bool(row["win"]) for row in rows)
         durations: list[float] = []
         for row in rows:
             activated = row["activated_at"]
@@ -226,10 +269,18 @@ class PostgresOutcomeRepository:
             activated=sum(row["activated_at"] is not None for row in rows),
             wins=wins,
             losses=losses,
-            open_signals=sum(row["state"] in {SignalState.CONFIRMED.value, SignalState.ACTIVE.value} for row in rows),
+            open_signals=sum(row["state"] in {state.value for state in WAITING_STATES | ACTIVE_STATES} for row in rows),
             tp1_runners=sum(row["state"] == SignalState.TP1_HIT.value for row in rows),
             tp2_hits=sum(row["tp2_hit_at"] is not None for row in rows),
-            invalidated=sum(row["invalidated_at"] is not None for row in rows),
+            invalidated=sum(
+                row["state"]
+                in {
+                    SignalState.INVALIDATED.value,
+                    SignalState.MISSED.value,
+                    SignalState.EXPIRED.value,
+                }
+                for row in rows
+            ),
             average_hold_hours=sum(durations) / len(durations) if durations else None,
         )
 
@@ -248,6 +299,8 @@ class PostgresOutcomeRepository:
             [
                 SignalState.TP2_HIT.value,
                 SignalState.STOPPED.value,
+                SignalState.SL_HIT.value,
+                SignalState.MISSED.value,
                 SignalState.INVALIDATED.value,
                 SignalState.EXPIRED.value,
             ],

@@ -77,6 +77,35 @@ class ExchangeClient:
         self._cache[key] = _CacheItem(time.monotonic(), value)
         return value
 
+    async def fetch_prices(self, symbols: tuple[str, ...]) -> dict[str, float]:
+        """Fetch one lightweight price snapshot for open setup monitoring."""
+        if not symbols:
+            return {}
+        futures_symbols = [self._futures_symbol(symbol) for symbol in symbols]
+
+        async def operation() -> dict[str, Any]:
+            result = await self._client.fetch_tickers(futures_symbols)
+            if not isinstance(result, dict):
+                raise ExchangeRequestError("malformed ticker response")
+            return result
+
+        tickers = await self._request("fetch_tickers:lifecycle", operation)
+        prices: dict[str, float] = {}
+        for symbol, futures_symbol in zip(symbols, futures_symbols, strict=True):
+            ticker = tickers.get(futures_symbol)
+            if not isinstance(ticker, dict):
+                continue
+            raw_price = ticker.get("last") or ticker.get("close")
+            if raw_price is None:
+                continue
+            try:
+                price = float(raw_price)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                prices[symbol] = price
+        return prices
+
     @staticmethod
     def _futures_symbol(symbol: str) -> str:
         """Map the configured spot-style label to CCXT's linear contract symbol."""

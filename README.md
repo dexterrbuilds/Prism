@@ -49,6 +49,7 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `WATCHLIST` | five requested pairs | Comma-separated CCXT symbols |
 | `PORT` | `10000` | Health server port |
 | `SCAN_INTERVAL_SECONDS` | `2700` | Delay after the complete watchlist (45 minutes) |
+| `LIFECYCLE_MONITOR_SECONDS` | `60` | Batch-ticker cadence for open setups between full scans |
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
@@ -89,6 +90,8 @@ DATABASE_URL=<Supabase Session Pooler connection string>
 ```
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
+
+Confirmed signals are persisted as live setups with an exact UTC expiry. Validity is derived per setup from its strategy-aware projected horizon and analysis timeframe, rounded to complete analysis candles; detectors may override it with timeframe-relative `validity_bars` metadata. There is no global fixed validity duration. Waiting setups can become `ENTRY_TRIGGERED`, `MISSED`, `INVALIDATED`, or `EXPIRED`; terminal pre-entry states cannot activate after a restart. Only activated setups enter win-rate accounting. TP1 remains a win if the runner later reaches its stop.
 
 Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
 
