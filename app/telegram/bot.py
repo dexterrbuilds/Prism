@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from io import BytesIO
 from typing import Any
 
@@ -27,7 +27,7 @@ class TelegramService:
         self._started = False
         self._polling = False
         self._manual_scan_callback: Callable[[], bool] | None = None
-        self._stats_callback: Callable[[int | None], PerformanceStats] | None = None
+        self._stats_callback: Callable[[int | None], Awaitable[PerformanceStats]] | None = None
         if settings.telegram_bot_token:
             self._application = Application.builder().token(settings.telegram_bot_token).build()
             self._application.add_handler(CommandHandler("start", self._handle_start))
@@ -38,7 +38,7 @@ class TelegramService:
     def bind_manual_scan(self, callback: Callable[[], bool]) -> None:
         self._manual_scan_callback = callback
 
-    def bind_stats(self, callback: Callable[[int | None], PerformanceStats]) -> None:
+    def bind_stats(self, callback: Callable[[int | None], Awaitable[PerformanceStats]]) -> None:
         self._stats_callback = callback
 
     @staticmethod
@@ -86,10 +86,13 @@ class TelegramService:
                     await update.effective_message.reply_text("Usage: /stats, /stats 7d, /stats 30d, or /stats all")
                     return
                 period_days = min(3650, int(value[:-1]))
-        await update.effective_message.reply_text(
-            format_stats(self._stats_callback(period_days)),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            stats = await self._stats_callback(period_days)
+        except Exception as exc:
+            logger.warning("telegram_stats_failure error=%s", type(exc).__name__)
+            await update.effective_message.reply_text("Performance statistics are temporarily unavailable. Please try again shortly.")
+            return
+        await update.effective_message.reply_text(format_stats(stats), parse_mode=ParseMode.MARKDOWN)
 
     async def _handle_manual_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context

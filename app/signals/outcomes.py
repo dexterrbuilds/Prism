@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.models import Direction, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
+from app.signals.lifecycle import ALLOWED_TRANSITIONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +42,7 @@ def _datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value).astimezone(UTC) if value else None
 
 
-def _payload(signal: Signal) -> str:
+def serialize_signal(signal: Signal) -> str:
     data: dict[str, Any] = {
         "id": signal.id,
         "symbol": signal.symbol,
@@ -63,7 +64,7 @@ def _payload(signal: Signal) -> str:
     return json.dumps(data, separators=(",", ":"), allow_nan=False)
 
 
-def _from_payload(raw: str) -> Signal:
+def deserialize_signal(raw: str) -> Signal:
     data = json.loads(raw)
     return Signal(
         id=str(data["id"]),
@@ -93,7 +94,9 @@ class OutcomeLedger:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(database_path)
         self._history_limit = history_limit
-        self._connection = sqlite3.connect(self.path)
+        # The async adapter serializes access but executes these blocking calls in
+        # worker threads, so the connection cannot be bound to its creator thread.
+        self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -133,10 +136,17 @@ class OutcomeLedger:
         )
         self._connection.commit()
 
-    def record_signal(self, signal: Signal) -> None:
+    def contains_signal(self, signal_id: str) -> bool:
+        row = self._connection.execute(
+            "SELECT 1 FROM signal_outcomes WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        return row is not None
+
+    def record_signal(self, signal: Signal) -> bool:
         now = signal.state_changed_at or signal.created_at
         activated_at = _iso(signal.activated_at or now) if signal.state is SignalState.ACTIVE else _iso(signal.activated_at)
-        self._connection.execute(
+        cursor = self._connection.execute(
             """
             INSERT OR IGNORE INTO signal_outcomes(
                 signal_id, created_at, updated_at, state, symbol, strategy,
@@ -154,14 +164,25 @@ class OutcomeLedger:
                 signal.score,
                 signal.current_price,
                 activated_at,
-                _payload(signal),
+                serialize_signal(signal),
             ),
         )
         self._prune()
         self._connection.commit()
+        return cursor.rowcount == 1
 
-    def record_event(self, signal: Signal) -> None:
-        self.record_signal(signal)
+    def record_event(self, signal: Signal) -> bool:
+        existing = self._connection.execute(
+            "SELECT state FROM signal_outcomes WHERE signal_id = ?",
+            (signal.id,),
+        ).fetchone()
+        inserted = False
+        if existing is None:
+            inserted = self.record_signal(signal)
+        else:
+            persisted_state = SignalState(str(existing["state"]))
+            if signal.state is persisted_state or signal.state not in ALLOWED_TRANSITIONS[persisted_state]:
+                return False
         event_at = signal.state_changed_at or datetime.now(UTC)
         fields: dict[SignalState, tuple[str, ...]] = {
             SignalState.ACTIVE: ("activated_at",),
@@ -172,7 +193,7 @@ class OutcomeLedger:
         }
         timestamp_fields = fields.get(signal.state, ())
         assignments = ["updated_at = ?", "state = ?", "current_price = ?", "payload = ?"]
-        values: list[Any] = [_iso(event_at), signal.state.value, signal.current_price, _payload(signal)]
+        values: list[Any] = [_iso(event_at), signal.state.value, signal.current_price, serialize_signal(signal)]
         for field in timestamp_fields:
             assignments.append(f"{field} = COALESCE({field}, ?)")
             values.append(_iso(event_at))
@@ -184,6 +205,7 @@ class OutcomeLedger:
             values,
         )
         self._connection.commit()
+        return inserted or existing is not None
 
     def load_open_signals(self) -> tuple[Signal, ...]:
         rows = self._connection.execute(
@@ -193,7 +215,7 @@ class OutcomeLedger:
         signals: list[Signal] = []
         for row in rows:
             try:
-                signals.append(_from_payload(str(row["payload"])))
+                signals.append(deserialize_signal(str(row["payload"])))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         return tuple(signals)

@@ -14,7 +14,8 @@ Trade geometry is validated before publication. LONG plans must satisfy `stop < 
 CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> momentum / volume / volatility / candles / patterns / divergence / liquidity
      -> setup registry -> category-capped score -> risk plan -> strict validator
-     -> bounded lifecycle + dedupe -> SQLite outcomes -> Telegram (or DRY_RUN log)
+     -> bounded lifecycle + dedupe -> Supabase Postgres / SQLite outcomes
+     -> Telegram (or DRY_RUN log)
 ```
 
 `FastAPI`, the scanner, and `python-telegram-bot` run concurrently on one asyncio loop. SIGTERM/SIGINT stops Uvicorn and polling, then closes CCXT.
@@ -51,7 +52,12 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
-| `SIGNAL_DB_PATH` | `/tmp/prism_signals.db` | SQLite outcome ledger; use a persistent-volume path in production |
+| `OUTCOME_BACKEND` | `auto` | `auto` selects Postgres when `DATABASE_URL` exists; or force `postgres` / `sqlite` |
+| `DATABASE_URL` | — | Supabase/Postgres connection string; use the Supabase Session Pooler URI on Railway |
+| `DATABASE_SCHEMA` | `prism` | Isolated schema created for Prism's tables |
+| `DATABASE_POOL_MIN` / `MAX` | `1` / `3` | Small async connection pool suitable for a 512 MB instance |
+| `DATABASE_SSL_REQUIRE` | `true` | Require TLS for the database connection |
+| `SIGNAL_DB_PATH` | `/tmp/prism_signals.db` | Local SQLite fallback path |
 | `SIGNAL_HISTORY_LIMIT` | `5000` | Bounded maximum outcome rows |
 
 The remaining tunables are documented in `.env.example`.
@@ -78,7 +84,8 @@ TELEGRAM_BOT_TOKEN=<BotFather token>
 TELEGRAM_CHAT_ID=<destination chat ID>
 TELEGRAM_CHAT_IDS=<additional ID>,<additional ID>
 TELEGRAM_CHANNEL_IDS=-1001234567890,@public_channel_username
-SIGNAL_DB_PATH=/home/prism/data/prism_signals.db
+OUTCOME_BACKEND=postgres
+DATABASE_URL=<Supabase Session Pooler connection string>
 ```
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
@@ -111,11 +118,33 @@ docker build -t prism-signal-engine .
 docker run --rm -p 10000:10000 --env-file .env prism-signal-engine
 ```
 
+## Supabase database
+
+Create a Supabase project, open **Connect**, choose **Session pooler**, and copy its Postgres URI. The session pooler uses port `5432` and works with Railway's IPv4 network. Put the complete URI in Railway as the secret `DATABASE_URL`; percent-encode special characters in the database password if constructing the URI manually. Do not use the Supabase project URL, anon key, service-role key, or transaction REST API—Prism connects directly to Postgres.
+
+Prism creates an isolated `prism` schema plus `metadata` and `signal_outcomes` tables on first startup. Lifecycle updates use transactions and row locks, signal IDs are primary keys, and duplicate or stale transitions are rejected. TP1 remains the permanent WIN marker even if a runner later stops; TP2 remains a separate statistic. The pool is intentionally bounded at 1–3 connections and asyncpg's prepared-statement cache is disabled for Supavisor compatibility.
+
+Use these production values:
+
+```bash
+OUTCOME_BACKEND=postgres
+DATABASE_URL=postgresql://postgres.<project-ref>:<encoded-password>@<pooler-host>:5432/postgres
+DATABASE_SCHEMA=prism
+DATABASE_POOL_MIN=1
+DATABASE_POOL_MAX=3
+DATABASE_SSL_REQUIRE=true
+SIGNAL_HISTORY_LIMIT=5000
+```
+
+Run only one Prism replica. Supabase can handle multiple database clients, but this V1 scanner and Telegram long-polling process deliberately has no distributed leader election; multiple replicas could scan and race to deliver the same alert. The database prevents duplicate outcomes, but it cannot retract an already-sent Telegram message.
+
 ## Railway and Render
 
 Railway: create a service from the repository, select the Dockerfile builder, add environment variables, and expose the generated domain. `railway.json` configures `/health`. Use at least one always-on replica if continuous scanning is required; free services that sleep cannot scan while suspended.
 
-For win-rate history across Railway redeploys, attach a persistent volume at `/home/prism/data` and keep `SIGNAL_DB_PATH=/home/prism/data/prism_signals.db`. Without a volume, the Docker filesystem—and therefore SQLite history—can reset on redeployment. Tracking begins when this version first starts; alerts sent before that point cannot be reconstructed automatically.
+With Supabase, do **not** attach a Railway volume and do not set `RAILWAY_RUN_UID`. Set the Postgres variables above and keep exactly one Railway replica. History then survives rebuilds, redeploys, and region changes independently of Railway's filesystem. Tracking begins when this version first starts against that Supabase database; older Telegram alerts cannot be reconstructed automatically.
+
+SQLite remains available for local/offline deployments. If you intentionally use SQLite on Railway, attach a volume at `/home/prism/data`, set `SIGNAL_DB_PATH=/home/prism/data/prism_signals.db`, and set `RAILWAY_RUN_UID=0` because Railway volumes mount as root.
 
 Render: create a Blueprint from `render.yaml`, add Telegram secrets in the dashboard, and switch `DRY_RUN=false` only after inspecting dry-run output. Free web services may suspend due to inactivity, so continuous operation may require a paid always-on instance or an external health ping permitted by the platform's terms.
 
@@ -132,7 +161,7 @@ The 100-point confluence score caps independent evidence families: trend/regime 
 - Daily/weekly levels are derived from bounded 4H history, so the previous week may be unavailable after large exchange gaps.
 - Trendline detection uses confirmed pivot boundaries rather than discretionary hand-drawn lines.
 - Pattern recognition is intentionally conservative and lightweight; weak geometry returns no pattern.
-- Open signal state and outcomes are restored from a bounded SQLite ledger when its path is persistent.
+- Open signal state and outcomes are restored from a bounded Supabase Postgres ledger, or from SQLite when that fallback is selected.
 - Live WR is an operational signal statistic, not a historical backtest or calibrated probability. Small samples are explicitly flagged.
 - No open interest, funding, liquidation, positioning, execution, or historical backtest database is included.
 - Free-tier egress, exchange availability, and sleeping policies vary by region/provider.

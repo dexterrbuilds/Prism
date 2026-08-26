@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 DEFAULT_WATCHLIST = (
@@ -50,11 +51,23 @@ class Settings:
     telegram_channel_ids: tuple[str, ...]
     signal_db_path: str
     signal_history_limit: int
+    outcome_backend: str
+    database_url: str | None
+    database_schema: str
+    database_pool_min: int
+    database_pool_max: int
+    database_ssl_require: bool
 
     @property
     def telegram_delivery_ids(self) -> tuple[str, ...]:
         """All alert destinations, de-duplicated without broadening command access."""
         return tuple(dict.fromkeys(self.telegram_chat_ids + self.telegram_channel_ids))
+
+    @property
+    def resolved_outcome_backend(self) -> str:
+        if self.outcome_backend == "auto":
+            return "postgres" if self.database_url else "sqlite"
+        return self.outcome_backend
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -63,6 +76,8 @@ class Settings:
         configured_chat_ids = _csv("TELEGRAM_CHAT_IDS", ())
         telegram_chat_ids = tuple(dict.fromkeys((primary_chat_id,) + configured_chat_ids)) if primary_chat_id else tuple(dict.fromkeys(configured_chat_ids))
         telegram_channel_ids = tuple(dict.fromkeys(_csv("TELEGRAM_CHANNEL_IDS", ())))
+        database_pool_min = max(1, min(5, int(os.getenv("DATABASE_POOL_MIN", "1"))))
+        database_pool_max = max(database_pool_min, min(10, int(os.getenv("DATABASE_POOL_MAX", "3"))))
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_id=primary_chat_id,
@@ -87,6 +102,12 @@ class Settings:
             telegram_channel_ids=telegram_channel_ids,
             signal_db_path=os.getenv("SIGNAL_DB_PATH", "/tmp/prism_signals.db"),
             signal_history_limit=max(100, min(50_000, int(os.getenv("SIGNAL_HISTORY_LIMIT", "5000")))),
+            outcome_backend=os.getenv("OUTCOME_BACKEND", "auto").strip().lower(),
+            database_url=os.getenv("DATABASE_URL") or None,
+            database_schema=os.getenv("DATABASE_SCHEMA", "prism").strip().lower(),
+            database_pool_min=database_pool_min,
+            database_pool_max=database_pool_max,
+            database_ssl_require=_bool("DATABASE_SSL_REQUIRE", True),
         )
 
     def validate(self) -> None:
@@ -96,3 +117,9 @@ class Settings:
             raise ValueError("Telegram token and at least one chat or channel destination are required unless DRY_RUN=true")
         if not self.watchlist:
             raise ValueError("WATCHLIST cannot be empty")
+        if self.outcome_backend not in {"auto", "sqlite", "postgres"}:
+            raise ValueError("OUTCOME_BACKEND must be 'auto', 'sqlite', or 'postgres'")
+        if self.resolved_outcome_backend == "postgres" and not self.database_url:
+            raise ValueError("DATABASE_URL is required when OUTCOME_BACKEND=postgres")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.database_schema):
+            raise ValueError("DATABASE_SCHEMA must be a lowercase PostgreSQL identifier")

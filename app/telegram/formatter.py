@@ -203,12 +203,14 @@ def format_status(settings: Settings, health: RuntimeHealth) -> str:
     )
     delivery = "DRY RUN — Telegram signal delivery disabled" if settings.dry_run else "Telegram delivery enabled"
     watch_alerts = "enabled" if settings.send_watch_alerts else "disabled"
+    outcome_store = "Supabase / PostgreSQL" if settings.resolved_outcome_backend == "postgres" else "SQLite"
     return (
         f"{icon} *Prism Bot Status*\n\n"
         f"*Service*\n{'Healthy' if healthy else 'Starting or degraded'}\n"
         f"*Scanner*\n{health.scanner.title()}\n"
         f"*Exchange*\n{health.exchange.title()}\n"
         f"*Delivery*\n{delivery}\n"
+        f"*Outcome Store*\n{outcome_store}\n"
         f"*Scan Cadence*\nEvery {_cadence(settings)}\n"
         f"*WATCH Alerts*\n{watch_alerts.title()}\n"
         f"*Last Completed Scan*\n{last_scan}\n"

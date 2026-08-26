@@ -14,6 +14,7 @@ def test_signal_format_is_clean_compact_and_chart_caption_safe() -> None:
         make_signal(score=88),
         supporting_strategies=("BOS_CONTINUATION", "EMA_PULLBACK"),
         evidence=tuple(f"Observed evidence item {index} with deterministic confirmation" for index in range(8)),
+        current_price=102.5,
     )
     message = format_signal(signal)
     assert "🟢 *BTC/USDT · LONG*" in message
@@ -24,7 +25,9 @@ def test_signal_format_is_clean_compact_and_chart_caption_safe() -> None:
     assert message.count("•") == 4
     assert "🧮 *$5,000 Margin Example*" in message
     assert "💹 *Current Price*" in message
+    assert "$102.5000 · latest closed 15M candle" in message
     assert "⚡ *Entry Trigger*" in message
+    assert "hold" in message
     assert "2× · $10,000 notional" in message
     assert "5× · $25,000 notional" in message
     assert len(message) <= 1024

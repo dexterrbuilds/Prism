@@ -30,9 +30,12 @@ class FakeExchange:
 class FakeTelegram:
     def __init__(self) -> None:
         self.published = 0
+        self.signals: list[Signal] = []
 
     async def publish(self, signal, lifecycle: bool = False, chart_png: bytes | None = None) -> bool:
+        del lifecycle, chart_png
         self.published += 1
+        self.signals.append(signal)
         return True
 
 
@@ -86,3 +89,41 @@ def test_near_tied_opposite_directions_are_rejected() -> None:
             _ranked_signal("FAILED_BREAKOUT", Direction.SHORT, 83),
         ]
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_pnl_card_failure_cannot_fail_symbol_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setattr("app.scanner.detect_setups", lambda context: [])
+
+    def fail_card(signal: Signal) -> bytes:
+        del signal
+        raise RuntimeError("render failure")
+
+    monkeypatch.setattr("app.scanner.render_pnl_card", fail_card)
+    telegram = FakeTelegram()
+    scanner = Scanner(Settings.from_env(), FakeExchange(), telegram, RuntimeHealth("fake"))  # type: ignore[arg-type]
+    as_of_ms = 1_800_000_000_000
+    active = _ranked_signal("BREAKOUT_RETEST", Direction.LONG, 88)
+    active = Signal(
+        id=active.id,
+        symbol=active.symbol,
+        strategy=active.strategy,
+        direction=active.direction,
+        regime=active.regime,
+        score=active.score,
+        grade=active.grade,
+        state=active.state,
+        trade=active.trade,
+        evidence=active.evidence,
+        created_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
+        current_price=100,
+        state_changed_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
+        activated_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
+    )
+    scanner.store.restore(active)
+
+    result = await scanner._scan_symbol("BTC/USDT", as_of_ms)
+
+    assert result.success
+    assert any(signal.state is SignalState.TP1_HIT for signal in telegram.signals)

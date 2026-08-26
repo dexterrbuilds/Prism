@@ -132,3 +132,40 @@ def test_entry_and_stop_in_same_candle_uses_conservative_loss_ordering() -> None
     )
 
     assert [event.state for event in events] == [SignalState.ACTIVE, SignalState.STOPPED]
+
+
+def test_restart_restore_does_not_replay_already_processed_candle() -> None:
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    active = replace(
+        make_signal(state=SignalState.ACTIVE),
+        state_changed_at=started,
+        activated_at=started,
+    )
+    first_store = SignalStore()
+    first_store.restore(active)
+    timestamp = int(started.timestamp() * 1000)
+    events = first_store.track_candles("BTC/USDT", [timestamp], [106], [99], [102])
+    tp1 = events[-1]
+    assert tp1.state is SignalState.TP1_HIT
+
+    restarted_store = SignalStore()
+    restarted_store.restore(tp1)
+    assert restarted_store.track_candles("BTC/USDT", [timestamp], [106], [99], [102]) == []
+
+
+def test_tp1_is_alerted_only_once_while_price_remains_above_target() -> None:
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    store = SignalStore()
+    store.restore(
+        replace(
+            make_signal(state=SignalState.ACTIVE),
+            state_changed_at=started,
+            activated_at=started,
+        )
+    )
+    first_timestamp = int(started.timestamp() * 1000)
+    first = store.track_candles("BTC/USDT", [first_timestamp], [106], [99], [105.5])
+    second = store.track_candles("BTC/USDT", [first_timestamp + 900_000], [107], [103], [106])
+
+    assert [event.state for event in first] == [SignalState.TP1_HIT]
+    assert second == []

@@ -32,10 +32,18 @@ def test_status_message_reports_runtime_health_without_secrets(monkeypatch) -> N
     message = format_status(settings, health)
     assert "Healthy" in message
     assert "Telegram delivery enabled" in message
+    assert "Outcome Store*\nSQLite" in message
     assert "Every 45 minutes" in message
     assert "WATCH Alerts*\nEnabled" in message
     assert "5/5" in message
     assert "token" not in message.lower()
+
+
+def test_status_reports_supabase_outcome_store(monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/postgres")
+    settings = Settings.from_env()
+    message = format_status(settings, RuntimeHealth("binance", scanner="sleeping"))
+    assert "Outcome Store*\nSupabase / PostgreSQL" in message
 
 
 def test_status_marks_failed_latest_scan_as_degraded(monkeypatch) -> None:
@@ -60,6 +68,14 @@ def test_manual_scan_button_callback_data_is_stable() -> None:
     button = keyboard.inline_keyboard[0][0]
     assert button.text == "🔄 Run Manual Scan"
     assert button.callback_data == "manual_scan"
+
+
+def test_bot_application_constructs_with_all_command_handlers(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    service = TelegramService(Settings.from_env(), RuntimeHealth("binance"))
+
+    assert service._application is not None
+    assert len(service._application.handlers[0]) == 4
 
 
 def test_multiple_telegram_recipients_are_deduplicated(monkeypatch) -> None:

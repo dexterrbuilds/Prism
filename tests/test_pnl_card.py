@@ -31,3 +31,19 @@ def test_tp1_pnl_card_is_bounded_png() -> None:
 def test_pnl_card_rejects_non_target_state() -> None:
     with pytest.raises(ValueError):
         render_pnl_card(make_signal(state=SignalState.ACTIVE))
+
+
+def test_tp2_pnl_card_renders_runner_completion() -> None:
+    started = datetime.now(UTC) - timedelta(hours=5)
+    signal = replace(
+        make_signal(state=SignalState.TP2_HIT),
+        current_price=110,
+        activated_at=started,
+        tp1_hit_at=started + timedelta(hours=2),
+        state_changed_at=started + timedelta(hours=5),
+    )
+
+    payload = render_pnl_card(signal)
+
+    assert payload.startswith(b"\x89PNG")
+    assert len(payload) < 1_000_000

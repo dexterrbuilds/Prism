@@ -14,7 +14,7 @@ from app.config import Settings
 from app.exchange.client import ExchangeClient
 from app.models import Direction, MarketSnapshot, RejectionReason, Signal, SignalGrade, SignalState
 from app.signals.lifecycle import SignalStore
-from app.signals.outcomes import OutcomeLedger
+from app.signals.repository import OutcomeRepository
 from app.signals.risk import RiskPlanningError, build_trade_plan
 from app.signals.scoring import score_candidate
 from app.signals.validator import validate_candidate
@@ -66,7 +66,7 @@ class Scanner:
         exchange: ExchangeClient,
         telegram: TelegramService,
         health: RuntimeHealth,
-        outcomes: OutcomeLedger | None = None,
+        outcomes: OutcomeRepository | None = None,
     ) -> None:
         self.settings = settings
         self.exchange = exchange
@@ -74,10 +74,16 @@ class Scanner:
         self.health = health
         self.outcomes = outcomes
         self.store = SignalStore(max_size=128)
-        if outcomes is not None:
-            for signal in outcomes.load_open_signals():
-                self.store.restore(signal)
         self._manual_scan_event = asyncio.Event()
+
+    async def restore_outcomes(self) -> None:
+        """Restore persisted open theses before the first market scan."""
+        if self.outcomes is None:
+            return
+        restored = await self.outcomes.load_open_signals()
+        for signal in restored:
+            self.store.restore(signal)
+        logger.info("signal_outcomes_restored count=%d", len(restored))
 
     def request_manual_scan(self) -> bool:
         """Wake the scanner once; never overlap an active watchlist scan."""
@@ -208,9 +214,19 @@ class Scanner:
                 selected.score,
                 len(valid_signals) - 1,
             )
-            if self.store.should_publish(selected):
+            persisted_duplicate = (
+                not self.settings.dry_run
+                and self.outcomes is not None
+                and await self.outcomes.contains_signal(selected.id)
+            )
+            if persisted_duplicate:
+                logger.info("signal_duplicate_suppressed symbol=%s signal_id=%s", symbol, selected.id)
+            elif self.store.should_publish(selected):
                 if not self.settings.dry_run and self.outcomes is not None:
-                    self.outcomes.record_signal(selected)
+                    inserted = await self.outcomes.record_signal(selected)
+                    if not inserted:
+                        logger.info("signal_duplicate_suppressed symbol=%s signal_id=%s", symbol, selected.id)
+                        return SymbolScanResult(True)
                 chart_png: bytes | None = None
                 try:
                     chart_png = render_signal_chart(
@@ -231,8 +247,12 @@ class Scanner:
             closed_15m.close,
         ):
             logger.info("signal_lifecycle symbol=%s strategy=%s state=%s", event.symbol, event.strategy, event.state.value)
+            publish_event = True
             if not self.settings.dry_run and self.outcomes is not None:
-                self.outcomes.record_event(event)
+                publish_event = await self.outcomes.record_event(event)
+            if not publish_event:
+                logger.info("signal_lifecycle_duplicate_suppressed symbol=%s state=%s", event.symbol, event.state.value)
+                continue
             lifecycle_card: bytes | None = None
             if event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT}:
                 try:
