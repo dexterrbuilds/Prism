@@ -2,18 +2,31 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 
-from app.models import Direction, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
+from app.models import (
+    AIReview,
+    AIReviewVerdict,
+    Direction,
+    DirectionalBias,
+    EntryDecision,
+    EntryQuality,
+    MarketRegime,
+    Signal,
+    SignalGrade,
+    SignalMode,
+    SignalState,
+    TradePlan,
+)
 from app.signals.lifecycle import (
     ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
     OPEN_STATES,
     STOP_STATES,
-    WAITING_STATES,
 )
 
 
@@ -30,6 +43,18 @@ class PerformanceStats:
     tp2_hits: int
     invalidated: int
     average_hold_hours: float | None
+    average_r: float | None = None
+    expectancy_r: float | None = None
+    median_mae_atr: float | None = None
+    p75_mae_atr: float | None = None
+    p90_mae_atr: float | None = None
+    median_mfe_atr: float | None = None
+    average_mae_atr: float | None = None
+    average_mfe_atr: float | None = None
+    winners_adverse_over_half_atr_pct: float | None = None
+    stopped_then_target_reached: int = 0
+    by_mode: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
+    breakdowns: dict[str, dict[str, dict[str, float | int | None]]] = field(default_factory=dict)
 
     @property
     def resolved(self) -> int:
@@ -79,12 +104,75 @@ def serialize_signal(signal: Signal) -> str:
         "tp2_hit_at": _iso(signal.tp2_hit_at),
         "stopped_at": _iso(signal.stopped_at),
         "lifecycle_reason": signal.lifecycle_reason,
+        "mode": signal.mode.value,
+        "entry_quality": asdict(signal.entry_quality) if signal.entry_quality is not None else None,
+        "ai_review": (
+            {
+                "verdict": signal.ai_review.verdict.value,
+                "reasoning": list(signal.ai_review.reasoning),
+                "risks": list(signal.ai_review.risks),
+                "provider": signal.ai_review.provider,
+                "model": signal.ai_review.model,
+                "reviewed_at": _iso(signal.ai_review.reviewed_at),
+            }
+            if signal.ai_review is not None
+            else None
+        ),
+        "atr_at_entry": signal.atr_at_entry,
+        "mae": signal.mae,
+        "mfe": signal.mfe,
+        "stopped_then_target_reached": signal.stopped_then_target_reached,
+        "follow_up_until": _iso(signal.follow_up_until),
+        "directional_bias": (
+            {
+                "direction": signal.directional_bias.direction.value if signal.directional_bias.direction else None,
+                "strength": signal.directional_bias.strength,
+                "timeframe": signal.directional_bias.timeframe,
+                "evidence": list(signal.directional_bias.evidence),
+            }
+            if signal.directional_bias is not None
+            else None
+        ),
     }
     return json.dumps(data, separators=(",", ":"), allow_nan=False)
 
 
 def deserialize_signal(raw: str) -> Signal:
     data = json.loads(raw)
+    quality_data = data.get("entry_quality")
+    entry_quality = None
+    if isinstance(quality_data, dict):
+        entry_quality = EntryQuality(
+            total=int(quality_data["total"]),
+            decision=EntryDecision(quality_data["decision"]),
+            categories={str(key): int(value) for key, value in quality_data.get("categories", {}).items()},
+            evidence=tuple(str(item) for item in quality_data.get("evidence", ())),
+            warnings=tuple(str(item) for item in quality_data.get("warnings", ())),
+            hard_reasons=tuple(str(item) for item in quality_data.get("hard_reasons", ())),
+            retest_completed=bool(quality_data.get("retest_completed", False)),
+            lower_timeframe_confirmed=bool(quality_data.get("lower_timeframe_confirmed", False)),
+            distance_from_entry_atr=float(quality_data.get("distance_from_entry_atr", 0.0)),
+        )
+    review_data = data.get("ai_review")
+    ai_review = None
+    if isinstance(review_data, dict):
+        ai_review = AIReview(
+            verdict=AIReviewVerdict(review_data["verdict"]),
+            reasoning=tuple(str(item) for item in review_data.get("reasoning", ())),
+            risks=tuple(str(item) for item in review_data.get("risks", ())),
+            provider=str(review_data["provider"]) if review_data.get("provider") else None,
+            model=str(review_data["model"]) if review_data.get("model") else None,
+            reviewed_at=_datetime(review_data.get("reviewed_at")),
+        )
+    bias_data = data.get("directional_bias")
+    directional_bias = None
+    if isinstance(bias_data, dict):
+        directional_bias = DirectionalBias(
+            Direction(bias_data["direction"]) if bias_data.get("direction") else None,
+            float(bias_data.get("strength", 0.0)),
+            str(bias_data.get("timeframe", "4h/1h")),
+            tuple(str(item) for item in bias_data.get("evidence", ())),
+        )
     return Signal(
         id=str(data["id"]),
         symbol=str(data["symbol"]),
@@ -119,6 +207,15 @@ def deserialize_signal(raw: str) -> Signal:
         tp2_hit_at=_datetime(data.get("tp2_hit_at")),
         stopped_at=_datetime(data.get("stopped_at")),
         lifecycle_reason=str(data["lifecycle_reason"]) if data.get("lifecycle_reason") else None,
+        mode=SignalMode(data.get("mode", SignalMode.INTRADAY.value)),
+        entry_quality=entry_quality,
+        ai_review=ai_review,
+        atr_at_entry=float(data["atr_at_entry"]) if data.get("atr_at_entry") is not None else None,
+        mae=float(data.get("mae", 0.0)),
+        mfe=float(data.get("mfe", 0.0)),
+        stopped_then_target_reached=bool(data.get("stopped_then_target_reached", False)),
+        follow_up_until=_datetime(data.get("follow_up_until")),
+        directional_bias=directional_bias,
     )
 
 
@@ -164,6 +261,13 @@ class OutcomeLedger:
                 missed_at TEXT,
                 expired_at TEXT,
                 lifecycle_reason TEXT,
+                mode TEXT NOT NULL DEFAULT 'INTRADAY',
+                entry_quality_score INTEGER,
+                atr_at_entry REAL,
+                mae REAL NOT NULL DEFAULT 0,
+                mfe REAL NOT NULL DEFAULT 0,
+                stopped_then_target_reached INTEGER NOT NULL DEFAULT 0,
+                follow_up_until TEXT,
                 win INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             );
@@ -181,12 +285,21 @@ class OutcomeLedger:
             "missed_at": "TEXT",
             "expired_at": "TEXT",
             "lifecycle_reason": "TEXT",
+            "mode": "TEXT NOT NULL DEFAULT 'INTRADAY'",
+            "entry_quality_score": "INTEGER",
+            "atr_at_entry": "REAL",
+            "mae": "REAL NOT NULL DEFAULT 0",
+            "mfe": "REAL NOT NULL DEFAULT 0",
+            "stopped_then_target_reached": "INTEGER NOT NULL DEFAULT 0",
+            "follow_up_until": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing_columns:
                 self._connection.execute(
                     f"ALTER TABLE signal_outcomes ADD COLUMN {column} {column_type}"  # noqa: S608 - fixed migration map
                 )
+        self._connection.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_mode ON signal_outcomes(mode)")
+        self._connection.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy ON signal_outcomes(strategy)")
         self._connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('tracking_started_at', ?)",
             (_iso(datetime.now(UTC)),),
@@ -208,8 +321,9 @@ class OutcomeLedger:
             INSERT OR IGNORE INTO signal_outcomes(
                 signal_id, created_at, updated_at, state, symbol, strategy,
                 direction, score, current_price, activated_at, expires_at,
-                entry_trigger_price, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry_trigger_price, mode, entry_quality_score, atr_at_entry,
+                mae, mfe, stopped_then_target_reached, follow_up_until, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -224,6 +338,13 @@ class OutcomeLedger:
                 activated_at,
                 _iso(signal.expires_at),
                 signal.entry_trigger_price,
+                signal.mode.value,
+                signal.entry_quality.total if signal.entry_quality else None,
+                signal.atr_at_entry,
+                signal.mae,
+                signal.mfe,
+                int(signal.stopped_then_target_reached),
+                _iso(signal.follow_up_until),
                 serialize_signal(signal),
             ),
         )
@@ -263,6 +384,13 @@ class OutcomeLedger:
             "entry_trigger_price = COALESCE(entry_trigger_price, ?)",
             "lifecycle_reason = ?",
             "payload = ?",
+            "mode = ?",
+            "entry_quality_score = ?",
+            "atr_at_entry = ?",
+            "mae = ?",
+            "mfe = ?",
+            "stopped_then_target_reached = ?",
+            "follow_up_until = ?",
         ]
         values: list[Any] = [
             _iso(event_at),
@@ -271,9 +399,16 @@ class OutcomeLedger:
             signal.entry_trigger_price,
             signal.lifecycle_reason,
             serialize_signal(signal),
+            signal.mode.value,
+            signal.entry_quality.total if signal.entry_quality else None,
+            signal.atr_at_entry,
+            signal.mae,
+            signal.mfe,
+            int(signal.stopped_then_target_reached),
+            _iso(signal.follow_up_until),
         ]
-        for field in timestamp_fields:
-            assignments.append(f"{field} = COALESCE({field}, ?)")
+        for timestamp_field in timestamp_fields:
+            assignments.append(f"{timestamp_field} = COALESCE({timestamp_field}, ?)")
             values.append(_iso(event_at))
         if signal.state in {SignalState.TP1_HIT, SignalState.TP2_HIT}:
             assignments.append("win = 1")
@@ -285,8 +420,30 @@ class OutcomeLedger:
         self._connection.commit()
         return inserted or existing is not None
 
+    def record_observation(self, signal: Signal) -> bool:
+        cursor = self._connection.execute(
+            """
+            UPDATE signal_outcomes
+            SET updated_at = ?, current_price = ?, mae = ?, mfe = ?,
+                stopped_then_target_reached = ?, follow_up_until = ?, payload = ?
+            WHERE signal_id = ?
+            """,
+            (
+                _iso(datetime.now(UTC)),
+                signal.current_price,
+                signal.mae,
+                signal.mfe,
+                int(signal.stopped_then_target_reached),
+                _iso(signal.follow_up_until),
+                serialize_signal(signal),
+                signal.id,
+            ),
+        )
+        self._connection.commit()
+        return cursor.rowcount == 1
+
     def load_open_signals(self) -> tuple[Signal, ...]:
-        open_values = tuple(state.value for state in OPEN_STATES)
+        open_values = tuple(state.value for state in OPEN_STATES | STOP_STATES)
         placeholders = ", ".join("?" for _ in open_values)
         rows = self._connection.execute(
             f"SELECT payload FROM signal_outcomes WHERE state IN ({placeholders})",  # noqa: S608 - generated placeholders
@@ -295,7 +452,14 @@ class OutcomeLedger:
         signals: list[Signal] = []
         for row in rows:
             try:
-                signals.append(deserialize_signal(str(row["payload"])))
+                signal = deserialize_signal(str(row["payload"]))
+                if signal.state in STOP_STATES and (
+                    signal.stopped_then_target_reached
+                    or signal.follow_up_until is None
+                    or datetime.now(UTC) >= signal.follow_up_until
+                ):
+                    continue
+                signals.append(signal)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         return tuple(signals)
@@ -311,7 +475,8 @@ class OutcomeLedger:
         rows = self._connection.execute(
             """
             SELECT state, win, activated_at, tp1_hit_at, tp2_hit_at,
-                   stopped_at, invalidated_at
+                   stopped_at, invalidated_at, payload, mode, mae, mfe,
+                   atr_at_entry, stopped_then_target_reached
             FROM signal_outcomes WHERE created_at >= ?
             """,
             (_iso(cutoff),),
@@ -319,11 +484,94 @@ class OutcomeLedger:
         wins = sum(int(row["win"]) for row in rows)
         losses = sum(row["state"] in {state.value for state in STOP_STATES} and not int(row["win"]) for row in rows)
         durations: list[float] = []
+        resolved_r: list[float] = []
+        mae_atr: list[float] = []
+        mfe_atr: list[float] = []
+        winner_mae_atr: list[float] = []
+        mode_rows: dict[str, list[sqlite3.Row]] = {}
+        dimension_rows: dict[str, dict[str, list[sqlite3.Row]]] = {
+            "symbol": {},
+            "strategy": {},
+            "direction": {},
+            "regime": {},
+            "ai_verdict": {},
+            "setup_score_band": {},
+            "entry_score_band": {},
+        }
         for row in rows:
             activated = _datetime(row["activated_at"])
             resolved = _datetime(row["tp1_hit_at"]) if int(row["win"]) else _datetime(row["stopped_at"])
             if activated and resolved and resolved >= activated:
                 durations.append((resolved - activated).total_seconds() / 3600)
+            try:
+                signal = deserialize_signal(str(row["payload"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            mode_rows.setdefault(signal.mode.value, []).append(row)
+            dimensions = {
+                "symbol": signal.symbol,
+                "strategy": signal.strategy,
+                "direction": signal.direction.value,
+                "regime": signal.regime.value,
+                "ai_verdict": signal.ai_review.verdict.value if signal.ai_review else "NOT_REVIEWED",
+                "setup_score_band": f"{signal.score // 5 * 5}-{signal.score // 5 * 5 + 4}",
+                "entry_score_band": (
+                    f"{signal.entry_quality.total // 5 * 5}-{signal.entry_quality.total // 5 * 5 + 4}"
+                    if signal.entry_quality
+                    else "UNKNOWN"
+                ),
+            }
+            for dimension, value in dimensions.items():
+                dimension_rows[dimension].setdefault(value, []).append(row)
+            if int(row["win"]):
+                target = signal.trade.tp2 if signal.tp2_hit_at else signal.trade.tp1
+                resolved_r.append(abs(target - (signal.entry_trigger_price or signal.trade.preferred_entry)) / signal.trade.risk_per_unit)
+            elif row["state"] in {state.value for state in STOP_STATES} and signal.activated_at is not None:
+                resolved_r.append(-1.0)
+            atr_entry = float(row["atr_at_entry"]) if row["atr_at_entry"] else None
+            if atr_entry and atr_entry > 0 and signal.activated_at is not None:
+                normalized_mae = float(row["mae"]) / atr_entry
+                mae_atr.append(normalized_mae)
+                mfe_atr.append(float(row["mfe"]) / atr_entry)
+                if int(row["win"]):
+                    winner_mae_atr.append(normalized_mae)
+        by_mode: dict[str, dict[str, float | int | None]] = {}
+        for mode, grouped in mode_rows.items():
+            mode_wins = sum(int(row["win"]) for row in grouped)
+            mode_losses = sum(row["state"] in {state.value for state in STOP_STATES} and not int(row["win"]) for row in grouped)
+            mode_resolved = mode_wins + mode_losses
+            by_mode[mode] = {
+                "signals": len(grouped),
+                "wins": mode_wins,
+                "losses": mode_losses,
+                "win_rate": mode_wins / mode_resolved * 100 if mode_resolved else None,
+            }
+        breakdowns: dict[str, dict[str, dict[str, float | int | None]]] = {}
+        for dimension, groups in dimension_rows.items():
+            breakdowns[dimension] = {}
+            for value, grouped in groups.items():
+                group_wins = sum(int(row["win"]) for row in grouped)
+                group_losses = sum(
+                    row["state"] in {state.value for state in STOP_STATES} and not int(row["win"])
+                    for row in grouped
+                )
+                group_resolved = group_wins + group_losses
+                breakdowns[dimension][value] = {
+                    "signals": len(grouped),
+                    "wins": group_wins,
+                    "losses": group_losses,
+                    "win_rate": group_wins / group_resolved * 100 if group_resolved else None,
+                }
+
+        def percentile(values: list[float], quantile: float) -> float | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            index = (len(ordered) - 1) * quantile
+            lower = int(index)
+            upper = min(len(ordered) - 1, lower + 1)
+            weight = index - lower
+            return ordered[lower] * (1 - weight) + ordered[upper] * weight
         return PerformanceStats(
             tracking_since=cutoff,
             period_days=period_days,
@@ -331,7 +579,10 @@ class OutcomeLedger:
             activated=sum(row["activated_at"] is not None for row in rows),
             wins=wins,
             losses=losses,
-            open_signals=sum(row["state"] in {state.value for state in WAITING_STATES | ACTIVE_STATES} for row in rows),
+            open_signals=sum(
+                row["state"] in {state.value for state in OPEN_STATES - {SignalState.TP1_HIT}}
+                for row in rows
+            ),
             tp1_runners=sum(row["state"] == SignalState.TP1_HIT.value for row in rows),
             tp2_hits=sum(row["tp2_hit_at"] is not None for row in rows),
             invalidated=sum(
@@ -344,6 +595,22 @@ class OutcomeLedger:
                 for row in rows
             ),
             average_hold_hours=sum(durations) / len(durations) if durations else None,
+            average_r=sum(resolved_r) / len(resolved_r) if resolved_r else None,
+            expectancy_r=sum(resolved_r) / len(resolved_r) if resolved_r else None,
+            median_mae_atr=median(mae_atr) if mae_atr else None,
+            p75_mae_atr=percentile(mae_atr, 0.75),
+            p90_mae_atr=percentile(mae_atr, 0.90),
+            median_mfe_atr=median(mfe_atr) if mfe_atr else None,
+            average_mae_atr=sum(mae_atr) / len(mae_atr) if mae_atr else None,
+            average_mfe_atr=sum(mfe_atr) / len(mfe_atr) if mfe_atr else None,
+            winners_adverse_over_half_atr_pct=(
+                sum(value > 0.5 for value in winner_mae_atr) / len(winner_mae_atr) * 100
+                if winner_mae_atr
+                else None
+            ),
+            stopped_then_target_reached=sum(int(row["stopped_then_target_reached"]) for row in rows),
+            by_mode=by_mode,
+            breakdowns=breakdowns,
         )
 
     def _prune(self) -> None:

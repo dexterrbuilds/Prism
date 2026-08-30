@@ -58,6 +58,18 @@ class Settings:
     database_pool_max: int
     database_ssl_require: bool
     lifecycle_monitor_seconds: float
+    minimum_entry_score: int
+    scalp_enabled: bool
+    scalp_minimum_setup_score: int
+    scalp_minimum_entry_score: int
+    ai_analysis_enabled: bool
+    ai_provider: str
+    ai_api_key: str | None
+    ai_model: str
+    ai_endpoint: str | None
+    ai_timeout_seconds: float
+    ai_cache_size: int
+    dry_run_track_outcomes: bool
 
     @property
     def telegram_delivery_ids(self) -> tuple[str, ...]:
@@ -84,7 +96,7 @@ class Settings:
             telegram_chat_id=primary_chat_id,
             exchange=os.getenv("EXCHANGE", "binance").lower(),
             watchlist=_csv("WATCHLIST", DEFAULT_WATCHLIST),
-            timeframes=("4h", "1h", "15m"),
+            timeframes=("4h", "1h", "15m", "5m") if _bool("SCALP_ENABLED", False) else ("4h", "1h", "15m"),
             candle_limit=candle_limit,
             scan_interval_seconds=max(15.0, float(os.getenv("SCAN_INTERVAL_SECONDS", "2700"))),
             request_timeout_ms=max(1_000, int(os.getenv("REQUEST_TIMEOUT_MS", "15000"))),
@@ -110,6 +122,18 @@ class Settings:
             database_pool_max=database_pool_max,
             database_ssl_require=_bool("DATABASE_SSL_REQUIRE", True),
             lifecycle_monitor_seconds=max(15.0, min(900.0, float(os.getenv("LIFECYCLE_MONITOR_SECONDS", "60")))),
+            minimum_entry_score=max(65, min(100, int(os.getenv("MINIMUM_ENTRY_SCORE", "75")))),
+            scalp_enabled=_bool("SCALP_ENABLED", False),
+            scalp_minimum_setup_score=max(70, min(100, int(os.getenv("SCALP_MINIMUM_SETUP_SCORE", "80")))),
+            scalp_minimum_entry_score=max(65, min(100, int(os.getenv("SCALP_MINIMUM_ENTRY_SCORE", "75")))),
+            ai_analysis_enabled=_bool("AI_ANALYSIS_ENABLED", False),
+            ai_provider=os.getenv("AI_PROVIDER", "openai_compatible").strip().lower(),
+            ai_api_key=os.getenv("AI_API_KEY") or None,
+            ai_model=os.getenv("AI_MODEL", "").strip(),
+            ai_endpoint=os.getenv("AI_ENDPOINT") or None,
+            ai_timeout_seconds=max(1.0, min(30.0, float(os.getenv("AI_TIMEOUT_SECONDS", "8")))),
+            ai_cache_size=max(8, min(512, int(os.getenv("AI_CACHE_SIZE", "128")))),
+            dry_run_track_outcomes=_bool("DRY_RUN_TRACK_OUTCOMES", True),
         )
 
     def validate(self) -> None:
@@ -125,3 +149,5 @@ class Settings:
             raise ValueError("DATABASE_URL is required when OUTCOME_BACKEND=postgres")
         if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.database_schema):
             raise ValueError("DATABASE_SCHEMA must be a lowercase PostgreSQL identifier")
+        if self.ai_analysis_enabled and self.ai_provider not in {"openai_compatible"}:
+            raise ValueError("AI_PROVIDER must be 'openai_compatible'")

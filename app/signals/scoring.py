@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.analysis.context import AnalysisContext
-from app.models import Direction, MarketRegime, SetupCandidate, SignalGrade, StructureBias
+from app.models import Direction, MarketRegime, SetupCandidate, SignalGrade, SignalMode, StructureBias
 
 CATEGORY_CAPS: dict[str, int] = {
     "trend": 20,
@@ -52,8 +52,10 @@ def _aligned_regime(regime: MarketRegime, direction: Direction) -> tuple[float, 
 
 
 def score_candidate(candidate: SetupCandidate, context: AnalysisContext) -> ScoreResult:
-    primary = context.timeframes["1h"]
-    lower = context.timeframes["15m"]
+    primary_tf = "15m" if candidate.mode is SignalMode.SCALP else "1h"
+    lower_tf = "5m" if candidate.mode is SignalMode.SCALP else "15m"
+    primary = context.timeframes[primary_tf]
+    lower = context.timeframes[lower_tf]
     evidence_map = candidate.evidence.as_mapping()
     categories: dict[str, int] = {}
     actual: list[str] = []
@@ -69,7 +71,7 @@ def score_candidate(candidate: SetupCandidate, context: AnalysisContext) -> Scor
         structure_strength = max(structure_strength, 0.65)
     categories["structure"] = round(CATEGORY_CAPS["structure"] * structure_strength)
     if primary.structure.bias is target_bias:
-        actual.append(f"1H {target_bias.value.lower()} swing structure")
+        actual.append(f"{primary_tf.upper()} {target_bias.value.lower()} swing structure")
 
     location_strength = 0.8 if evidence_map["location"] else 0.25
     near_quality_zone = any(zone.low - float(primary.indicators.atr[-1]) * 0.2 <= candidate.ideal_entry_high and zone.high + float(primary.indicators.atr[-1]) * 0.2 >= candidate.ideal_entry_low and zone.score >= 4 for zone in primary.zones)
@@ -96,17 +98,17 @@ def score_candidate(candidate: SetupCandidate, context: AnalysisContext) -> Scor
         volume_strength += 0.3
     categories["volume"] = round(CATEGORY_CAPS["volume"] * min(1.0, volume_strength))
     if rv >= 1.2:
-        actual.append(f"1H relative volume {rv:.2f}x")
+        actual.append(f"{primary_tf.upper()} relative volume {rv:.2f}x")
 
     categories["pattern"] = round(CATEGORY_CAPS["pattern"] * candidate.quality)
-    lower_price = context.snapshot.series["15m"].latest_close
+    lower_price = context.snapshot.series[lower_tf].latest_close
     lower_atr = float(lower.indicators.atr[-1])
     candle_at_location = candidate.ideal_entry_low - lower_atr * 0.35 <= lower_price <= candidate.ideal_entry_high + lower_atr * 0.35
-    matching_candle = candle_at_location and any(item.direction is candidate.direction and item.index == len(context.snapshot.series["15m"]) - 1 for item in lower.candlesticks)
+    matching_candle = candle_at_location and any(item.direction is candidate.direction and item.index == len(context.snapshot.series[lower_tf]) - 1 for item in lower.candlesticks)
     categories["candlestick"] = CATEGORY_CAPS["candlestick"] if matching_candle else (2 if candidate.confirmed else 0)
     volatility_strength = 0.8 if primary.volatility.value in {"NORMAL", "EXPANDING"} else 0.45
     categories["volatility"] = round(CATEGORY_CAPS["volatility"] * volatility_strength)
-    actual.append(f"1H volatility is {primary.volatility.value.lower()}")
+    actual.append(f"{primary_tf.upper()} volatility is {primary.volatility.value.lower()}")
     categories["higher_timeframe"] = round(CATEGORY_CAPS["higher_timeframe"] * regime_strength)
 
     for name in CATEGORY_CAPS:

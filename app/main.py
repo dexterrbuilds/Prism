@@ -7,6 +7,7 @@ from contextlib import suppress
 
 import uvicorn
 
+from app.ai import build_ai_review_service
 from app.api.health import RuntimeHealth, create_app
 from app.config import Settings
 from app.exchange.client import ExchangeClient, ExchangeRequestError
@@ -32,7 +33,12 @@ async def run() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop_event.set)
-    health = RuntimeHealth(settings.exchange)
+    ai_reviews = build_ai_review_service(settings)
+    health = RuntimeHealth(
+        settings.exchange,
+        ai="enabled" if ai_reviews.enabled else "disabled",
+        scalp="enabled" if settings.scalp_enabled else "disabled",
+    )
     exchange = ExchangeClient(settings)
     outcomes: OutcomeRepository = await create_outcome_repository(settings)
     logger.info(
@@ -45,7 +51,7 @@ async def run() -> None:
         logger.warning("outcome_tracking_ephemeral path=%s", outcomes.location)
     telegram = TelegramService(settings, health)
     telegram.bind_stats(outcomes.stats)
-    scanner = Scanner(settings, exchange, telegram, health, outcomes)
+    scanner = Scanner(settings, exchange, telegram, health, outcomes, ai_reviews)
     await scanner.restore_outcomes()
     telegram.bind_manual_scan(scanner.request_manual_scan)
     app = create_app(health)

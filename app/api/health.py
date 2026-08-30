@@ -8,6 +8,8 @@ from fastapi import FastAPI
 @dataclass(slots=True)
 class RuntimeHealth:
     exchange: str
+    ai: str = "disabled"
+    scalp: str = "disabled"
     scanner: str = "starting"
     last_scan_ms: int | None = None
     scanned_symbols: int = 0
@@ -32,6 +34,8 @@ def create_app(health: RuntimeHealth) -> FastAPI:
             "status": status,
             "scanner": health.scanner,
             "exchange": health.exchange,
+            "ai": health.ai,
+            "scalp": health.scalp,
             "last_scan_ms": health.last_scan_ms,
             "scanned_symbols": health.scanned_symbols,
             "scan_errors": health.scan_errors,

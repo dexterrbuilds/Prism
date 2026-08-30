@@ -1,10 +1,10 @@
 # Prism Signal Engine
 
-Prism is a deterministic, asynchronous crypto-futures technical-analysis research and signal engine. It scans a deliberately small USD-M watchlist, analyzes only closed candles, and publishes only confirmed high-confluence plans with structural risk. It does not place orders, use an LLM, or treat a confluence score as a win probability.
+Prism is a deterministic, asynchronous crypto-futures technical-analysis research and signal engine. It scans a deliberately small USD-M watchlist, analyzes only closed candles, and publishes only confirmed high-confluence plans with structural risk. It does not place orders or treat a score as a win probability. V2 can optionally call an external AI endpoint as a conservative entry-quality filter; deterministic analysis and hard risk rules remain authoritative.
 
 ## Architecture
 
-The runtime owns one persistent CCXT client. Each scan fetches at most 250 closed candles for `4h`, `1h`, and `15m`, with bounded concurrency and retry/backoff. NumPy arrays flow through pure analysis functions into modular setup detectors. Candidates pass category-capped scoring, entry/chase, structural stop, 2R, opposing-structure, volume, volatility, and higher-timeframe filters. A bounded lifecycle store deduplicates alerts.
+The runtime owns one persistent CCXT client. Each scan fetches at most 250 closed candles for `4h`, `1h`, and `15m`, plus `5m` only when SCALP mode is enabled, with bounded concurrency and retry/backoff. NumPy arrays flow through pure analysis functions into modular setup detectors. Candidates pass separate setup and entry-quality gates, structural stop, 2R, opposing-structure, volume, volatility, and higher-timeframe filters. A bounded lifecycle store deduplicates alerts.
 
 All valid candidates for a symbol are ranked before publication. Only one directional thesis can be sent per symbol per scan; overlapping detector labels are shown as supporting setups on that alert. Near-tied opposing directions are rejected as ambiguous. Deduplication is keyed by symbol and direction rather than strategy label.
 
@@ -13,7 +13,8 @@ Trade geometry is validated before publication. LONG plans must satisfy `stop < 
 ```text
 CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> momentum / volume / volatility / candles / patterns / divergence / liquidity
-     -> setup registry -> category-capped score -> risk plan -> strict validator
+     -> setup registry -> category-capped setup score -> structure-derived entry plan
+     -> entry-quality score -> strict risk validator -> optional AI quality review
      -> bounded lifecycle + dedupe -> Supabase Postgres / SQLite outcomes
      -> Telegram (or DRY_RUN log)
 ```
@@ -53,6 +54,13 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
+| `MINIMUM_ENTRY_SCORE` | `75` | Independent intraday entry-quality activation threshold |
+| `SCALP_ENABLED` | `false` | Enable the separate 1H/15M/5M scalp strategy engine |
+| `SCALP_MINIMUM_SETUP_SCORE` / `SCALP_MINIMUM_ENTRY_SCORE` | `80` / `75` | Independent scalp gates |
+| `DRY_RUN_TRACK_OUTCOMES` | `true` | Persist hypothetical lifecycle and excursion analytics during dry-run |
+| `AI_ANALYSIS_ENABLED` | `false` | Enable the optional external AI entry-quality filter |
+| `AI_PROVIDER` | `openai_compatible` | V2 provider adapter |
+| `AI_API_KEY` / `AI_MODEL` / `AI_ENDPOINT` | — | Required only when AI analysis is enabled |
 | `OUTCOME_BACKEND` | `auto` | `auto` selects Postgres when `DATABASE_URL` exists; or force `postgres` / `sqlite` |
 | `DATABASE_URL` | — | Supabase/Postgres connection string; use the Supabase Session Pooler URI on Railway |
 | `DATABASE_SCHEMA` | `prism` | Isolated schema created for Prism's tables |
@@ -74,7 +82,7 @@ ruff check app tests
 mypy app
 ```
 
-For safe real-market verification, leave `DRY_RUN=true`. It still loads markets, fetches live futures OHLCV, performs the complete analysis, and logs signals that would be delivered.
+For safe real-market verification, leave `DRY_RUN=true`. It still loads markets, fetches live futures OHLCV, performs the complete analysis, persists hypothetical lifecycle/MAE/MFE when `DRY_RUN_TRACK_OUTCOMES=true`, and logs signals that would be delivered.
 
 For Telegram delivery every 45-minute scan cycle, configure the destination privately in the deployment environment:
 
@@ -91,7 +99,7 @@ DATABASE_URL=<Supabase Session Pooler connection string>
 
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
 
-Confirmed signals are persisted as live setups with an exact UTC expiry. Validity is derived per setup from its strategy-aware projected horizon and analysis timeframe, rounded to complete analysis candles; detectors may override it with timeframe-relative `validity_bars` metadata. There is no global fixed validity duration. Waiting setups can become `ENTRY_TRIGGERED`, `MISSED`, `INVALIDATED`, or `EXPIRED`; terminal pre-entry states cannot activate after a restart. Only activated setups enter win-rate accounting. TP1 remains a win if the runner later reaches its stop.
+Confirmed signals are persisted as live setups with an exact UTC expiry. Validity is derived per setup from its strategy-aware projected horizon and analysis timeframe, rounded to complete analysis candles; there is no global fixed validity duration. V2 separates directional bias, setup score, and entry quality. A strong thesis remains `WAITING_FOR_ENTRY` until a closed execution-timeframe retest and structure response pass the independent entry gate; a ticker touch alone cannot confirm a V2 entry. Terminal pre-entry states cannot activate after a restart. Only activated setups enter win-rate accounting. TP1 remains a win if the runner later reaches its stop.
 
 Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
 
@@ -186,9 +194,15 @@ Render: create a Blueprint from `render.yaml`, add Telegram secrets in the dashb
 
 The 100-point confluence score caps independent evidence families: trend/regime 20, structure 20, location/S&R 15, momentum 10, volume 10, setup/pattern 10, candlestick 5, volatility 5, and higher timeframe 5. RSI/Stochastic/CCI share one momentum cap; EMA families share trend/regime; OBV/MFI/A-D share volume. Scores mean confluence, not probability: below 70 IGNORE, 70–79 WATCH, 80–89 VALID, and 90–100 EXCEPTIONAL. An unclear regime caps the score and requires at least 84.
 
+Entry quality is a separate 100-point gate: location 20, retest 20, execution-timeframe structure 20, structural stop 15, room to target 10, momentum 5, volume 5, and ATR/chase quality 5. Scores below 65 reject the entry, 65–74 wait, 75–84 are valid, and 85+ are high quality. Prism never averages setup and entry scores: the defaults require setup ≥80 and entry ≥75, plus all hard risk rules.
+
+The optional AI adapter receives only a compact JSON summary after deterministic setup, entry, and hard-risk validation. It can return `APPROVE`, `WAIT`, or `REJECT`; it cannot invent setups, reverse direction, rescue sub-threshold entry quality, or override a hard rejection. Reviews are cached in a bounded in-memory LRU. Timeout, HTTP failure, malformed JSON, or provider unavailability returns `UNAVAILABLE` and the deterministic engine continues unchanged.
+
 ## Implemented setup classifications
 
 `TREND_PULLBACK`, `EMA_PULLBACK`, `BREAKOUT`, `BREAKDOWN`, `BREAKOUT_RETEST`, `BREAKDOWN_RETEST`, `SUPPORT_BOUNCE`, `RESISTANCE_REJECTION`, `RANGE_LOW_REVERSAL`, `RANGE_HIGH_REVERSAL`, `RANGE_BREAKOUT`, `TRENDLINE_BREAK`, `TRENDLINE_RETEST`, `LIQUIDITY_SWEEP_REVERSAL`, `FAILED_BREAKOUT`, `FAILED_BREAKDOWN`, `BOS_CONTINUATION`, `CHOCH_REVERSAL`, `DIVERGENCE_REVERSAL`, `VOLATILITY_BREAKOUT`, `BOLLINGER_MEAN_REVERSION`, `BULL_FLAG_BREAKOUT`, `BEAR_FLAG_BREAKDOWN`, `TRIANGLE_BREAKOUT`, `WEDGE_BREAKOUT`, `DOUBLE_BOTTOM_REVERSAL`, `DOUBLE_TOP_REVERSAL`, `HEAD_AND_SHOULDERS`, `INVERSE_HEAD_AND_SHOULDERS`, and `MOMENTUM_CONTINUATION`.
+
+SCALP mode adds `SCALP_LIQUIDITY_SWEEP_RECLAIM`, `SCALP_BREAKOUT_RETEST`, `SCALP_FAILED_BREAKOUT`, `SCALP_FAILED_BREAKDOWN`, `SCALP_SUPPORT_REJECTION`, `SCALP_RESISTANCE_REJECTION`, `SCALP_RANGE_LOW_LONG`, `SCALP_RANGE_HIGH_SHORT`, `SCALP_EMA_PULLBACK`, `SCALP_VWAP_RECLAIM`, `SCALP_VWAP_REJECTION`, `SCALP_BOS_CONTINUATION`, `SCALP_CHOCH_REVERSAL`, `SCALP_MOMENTUM_CONTINUATION`, and `SCALP_VOLATILITY_EXPANSION`.
 
 ## Known V1 limitations
 

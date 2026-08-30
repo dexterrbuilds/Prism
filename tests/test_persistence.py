@@ -60,7 +60,20 @@ def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
     migrated.close()
     ledger.close()
 
-    assert {"expires_at", "entry_trigger_price", "missed_at", "expired_at", "lifecycle_reason"} <= columns
+    assert {
+        "expires_at",
+        "entry_trigger_price",
+        "missed_at",
+        "expired_at",
+        "lifecycle_reason",
+        "mode",
+        "entry_quality_score",
+        "atr_at_entry",
+        "mae",
+        "mfe",
+        "stopped_then_target_reached",
+        "follow_up_until",
+    } <= columns
 
 
 @pytest.mark.asyncio

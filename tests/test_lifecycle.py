@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.models import Direction, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
+from app.models import Direction, EntryDecision, EntryQuality, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
 from app.signals.lifecycle import SignalStore, transition
 
 
@@ -301,3 +301,64 @@ def test_tp1_is_alerted_only_once_while_price_remains_above_target() -> None:
 
     assert [event.state for event in first] == [SignalState.TP1_HIT]
     assert second == []
+
+
+def test_v2_waiting_entry_cannot_activate_from_price_touch_alone() -> None:
+    signal = replace(make_waiting_signal(), state=SignalState.WAITING_FOR_ENTRY)
+    store = SignalStore()
+    store.restore(signal)
+    assert store.track_price("BTC/USDT", 100, observed_at=signal.created_at + timedelta(minutes=1)) == []
+
+
+def test_v2_entry_ready_requires_quality_retest_and_structure_then_triggers_once() -> None:
+    signal = replace(make_waiting_signal(), state=SignalState.WAITING_FOR_ENTRY)
+    quality = EntryQuality(
+        88,
+        EntryDecision.HIGH_QUALITY,
+        {},
+        ("retest", "CHOCH"),
+        retest_completed=True,
+        lower_timeframe_confirmed=True,
+    )
+    store = SignalStore()
+    store.restore(signal)
+    ready_at = signal.created_at + timedelta(minutes=1)
+    ready = store.mark_entry_ready("BTC/USDT", Direction.LONG, quality, observed_at=ready_at, current_price=100)
+    assert ready is not None and ready.state is SignalState.ENTRY_READY
+    events = store.track_price("BTC/USDT", 100, observed_at=ready_at + timedelta(minutes=1))
+    duplicate = store.track_price("BTC/USDT", 100, observed_at=ready_at + timedelta(minutes=2))
+    assert [event.state for event in events] == [SignalState.ENTRY_TRIGGERED]
+    assert duplicate == []
+
+
+def test_mae_mfe_and_stopped_then_target_reached_are_tracked() -> None:
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    active = replace(make_signal(state=SignalState.ACTIVE), state_changed_at=started, activated_at=started)
+    store = SignalStore()
+    store.restore(active)
+    store.track_candles("BTC/USDT", [int(started.timestamp() * 1000)], [104], [97], [101])
+    tracked = store.signals_for_symbol("BTC/USDT")[0]
+    assert tracked.mae == 3
+    assert tracked.mfe == 4
+    stopped = store.track_price("BTC/USDT", 94, observed_at=started + timedelta(minutes=16))[-1]
+    assert stopped.state is SignalState.STOPPED
+    store.track_price("BTC/USDT", 111, observed_at=started + timedelta(minutes=17))
+    followed = store.signals_for_symbol("BTC/USDT")[0]
+    assert followed.stopped_then_target_reached is True
+
+
+def test_stopped_trade_followup_does_not_block_new_directional_setup() -> None:
+    started = datetime(2026, 8, 25, 0, 0, tzinfo=UTC)
+    active = replace(make_signal(state=SignalState.ACTIVE), id="old", state_changed_at=started, activated_at=started)
+    store = SignalStore()
+    store.restore(active)
+    store.track_price("BTC/USDT", 94, observed_at=started + timedelta(minutes=1))
+    new_setup = replace(
+        make_waiting_signal(),
+        id="new",
+        state=SignalState.WAITING_FOR_ENTRY,
+        created_at=started + timedelta(minutes=2),
+        state_changed_at=started + timedelta(minutes=2),
+    )
+    assert store.should_publish(new_setup)
+    assert {signal.id for signal in store.signals_for_symbol("BTC/USDT")} == {"old", "new"}

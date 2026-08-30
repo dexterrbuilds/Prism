@@ -17,6 +17,25 @@ class Direction(StrEnum):
     SHORT = "SHORT"
 
 
+class SignalMode(StrEnum):
+    INTRADAY = "INTRADAY"
+    SCALP = "SCALP"
+
+
+class EntryDecision(StrEnum):
+    REJECT = "REJECT"
+    WAIT = "WAIT"
+    VALID = "VALID"
+    HIGH_QUALITY = "HIGH_QUALITY"
+
+
+class AIReviewVerdict(StrEnum):
+    APPROVE = "APPROVE"
+    WAIT = "WAIT"
+    REJECT = "REJECT"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class MarketRegime(StrEnum):
     STRONG_BULLISH_TREND = "STRONG_BULLISH_TREND"
     BULLISH_TREND = "BULLISH_TREND"
@@ -63,6 +82,11 @@ class VolatilityClass(StrEnum):
 
 
 class SignalState(StrEnum):
+    # V2 staged lifecycle. Existing values below remain deserializable.
+    BIAS_DETECTED = "BIAS_DETECTED"
+    SETUP_FORMING = "SETUP_FORMING"
+    WAITING_FOR_ENTRY = "WAITING_FOR_ENTRY"
+    ENTRY_READY = "ENTRY_READY"
     # Setup lifecycle used by newly published signals.
     CREATED = "CREATED"
     WAITING_ENTRY = "WAITING_ENTRY"
@@ -103,6 +127,8 @@ class RejectionReason(StrEnum):
     DATA_QUALITY = "DATA_QUALITY"
     EXCESSIVE_VOLATILITY = "EXCESSIVE_VOLATILITY"
     INVALIDATED_PATTERN = "INVALIDATED_PATTERN"
+    ENTRY_QUALITY = "ENTRY_QUALITY"
+    INSUFFICIENT_VOLATILITY = "INSUFFICIENT_VOLATILITY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +256,48 @@ class SetupCandidate:
     evidence: ConfluenceEvidence
     confirmed: bool
     metadata: Mapping[str, float | str | bool] = field(default_factory=dict)
+    mode: SignalMode = SignalMode.INTRADAY
+
+
+@dataclass(frozen=True, slots=True)
+class DirectionalBias:
+    direction: Direction | None
+    strength: float
+    timeframe: str
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EntryPlan:
+    zone_low: float
+    zone_high: float
+    preferred_entry: float
+    entry_type: str
+    trigger: str
+    source_levels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EntryQuality:
+    total: int
+    decision: EntryDecision
+    categories: Mapping[str, int]
+    evidence: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+    hard_reasons: tuple[str, ...] = ()
+    retest_completed: bool = False
+    lower_timeframe_confirmed: bool = False
+    distance_from_entry_atr: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class AIReview:
+    verdict: AIReviewVerdict
+    reasoning: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+    provider: str | None = None
+    model: str | None = None
+    reviewed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +352,15 @@ class Signal:
     tp2_hit_at: datetime | None = None
     stopped_at: datetime | None = None
     lifecycle_reason: str | None = None
+    mode: SignalMode = SignalMode.INTRADAY
+    entry_quality: EntryQuality | None = None
+    ai_review: AIReview | None = None
+    atr_at_entry: float | None = None
+    mae: float = 0.0
+    mfe: float = 0.0
+    stopped_then_target_reached: bool = False
+    follow_up_until: datetime | None = None
+    directional_bias: DirectionalBias | None = None
 
     @staticmethod
     def utcnow() -> datetime:

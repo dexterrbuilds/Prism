@@ -26,7 +26,7 @@ def candles(
     volume: np.ndarray | None = None,
 ) -> CandleSeries:
     c = np.asarray(close, dtype=np.float64)
-    interval = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}[timeframe]
+    interval = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}[timeframe]
     timestamp = np.arange(len(c), dtype=np.int64) * interval
     o = np.asarray(open_, dtype=np.float64) if open_ is not None else c.copy()
     h = np.asarray(high, dtype=np.float64) if high is not None else np.maximum(o, c) + 1.0
@@ -42,7 +42,7 @@ def indicators(size: int = 250, *, price: float = 100.0, atr: float = 2.0, rsi: 
         const(price - 1), const(price - 2), const(price - 3), const(price - 4), const(price - 2), const(price - 4),
         const(25), const(30), const(15), const(atr), const(atr / price), rsi if rsi is not None else const(55),
         const(1), const(0.5), const(0.5), const(60), const(55), const(1), const(50),
-        const(price + 4), const(price), const(price - 4), const(0.08), const(100), const(1.5),
+        const(price + 4), const(price), const(price - 4), const(0.08), const(price), const(100), const(1.5),
         np.linspace(1, 2, size), const(55), np.linspace(1, 2, size),
     )
 

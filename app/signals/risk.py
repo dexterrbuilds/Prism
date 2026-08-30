@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from app.models import Direction, SetupCandidate, SupportResistanceZone, TradePlan
+from app.models import Direction, EntryPlan, SetupCandidate, SupportResistanceZone, TradePlan
 
 
 class RiskPlanningError(ValueError):
@@ -13,7 +13,10 @@ def estimate_hold_time(strategy: str, target_distance_atr: float) -> tuple[float
     """Technical horizon estimate, not an empirical performance statistic."""
     if target_distance_atr <= 0:
         raise RiskPlanningError("target ATR distance must be positive")
-    if any(token in strategy for token in ("REVERSAL", "HEAD_AND_SHOULDERS", "DOUBLE_")):
+    scalp = strategy.startswith("SCALP_")
+    if scalp:
+        hours_per_atr = 0.65
+    elif any(token in strategy for token in ("REVERSAL", "HEAD_AND_SHOULDERS", "DOUBLE_")):
         hours_per_atr = 4.5
     elif any(token in strategy for token in ("BREAKOUT", "BREAKDOWN", "MOMENTUM", "BOS_")):
         hours_per_atr = 2.75
@@ -22,8 +25,12 @@ def estimate_hold_time(strategy: str, target_distance_atr: float) -> tuple[float
     else:
         hours_per_atr = 3.25
     center = target_distance_atr * hours_per_atr
-    low = max(4.0, min(72.0, round(center * 0.65)))
-    high = max(low + 2.0, min(120.0, round(center * 1.6)))
+    if scalp:
+        low = max(0.5, min(6.0, round(center * 0.65, 1)))
+        high = max(low + 0.5, min(12.0, round(center * 1.6, 1)))
+    else:
+        low = max(4.0, min(72.0, round(center * 0.65)))
+        high = max(low + 2.0, min(120.0, round(center * 1.6)))
     return low, high
 
 
@@ -86,17 +93,22 @@ def build_trade_plan(
     current_price: float,
     atr: float,
     zones: tuple[SupportResistanceZone, ...],
+    entry_plan: EntryPlan | None = None,
 ) -> TradePlan:
     if atr <= 0:
         raise RiskPlanningError("ATR must be positive")
-    midpoint = (candidate.ideal_entry_low + candidate.ideal_entry_high) / 2
-    preferred = current_price if candidate.ideal_entry_low <= current_price <= candidate.ideal_entry_high else midpoint
+    entry_low = entry_plan.zone_low if entry_plan is not None else candidate.ideal_entry_low
+    entry_high = entry_plan.zone_high if entry_plan is not None else candidate.ideal_entry_high
+    midpoint = entry_plan.preferred_entry if entry_plan is not None else (entry_low + entry_high) / 2
+    # V2 never moves the planned entry to the current market price. The plan is
+    # derived from structure first and activation waits for price to return.
+    preferred = midpoint
     if candidate.direction is Direction.LONG:
-        stop = min(candidate.invalidation_level, candidate.ideal_entry_low) - atr * 0.15
+        stop = min(candidate.invalidation_level, entry_low) - atr * 0.15
         if stop >= preferred:
             raise RiskPlanningError("long stop is not below entry")
     else:
-        stop = max(candidate.invalidation_level, candidate.ideal_entry_high) + atr * 0.15
+        stop = max(candidate.invalidation_level, entry_high) + atr * 0.15
         if stop <= preferred:
             raise RiskPlanningError("short stop is not above entry")
     risk = abs(preferred - stop)
@@ -114,11 +126,11 @@ def build_trade_plan(
     tp3 = beyond_tp2[0].midpoint if beyond_tp2 else None
     hold_low, hold_high = estimate_hold_time(candidate.strategy, abs(tp2 - preferred) / atr)
     plan = TradePlan(
-        candidate.ideal_entry_low,
-        candidate.ideal_entry_high,
+        entry_low,
+        entry_high,
         preferred,
-        candidate.strategy.lower().replace("_", " "),
-        candidate.trigger,
+        entry_plan.entry_type if entry_plan is not None else candidate.strategy.lower().replace("_", " "),
+        entry_plan.trigger if entry_plan is not None else candidate.trigger,
         stop,
         risk,
         risk / atr,

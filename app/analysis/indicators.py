@@ -34,6 +34,7 @@ class IndicatorSet:
     bb_middle: FloatArray
     bb_lower: FloatArray
     bb_width: FloatArray
+    vwap: FloatArray
     volume_sma20: FloatArray
     relative_volume: FloatArray
     obv: FloatArray
@@ -69,10 +70,20 @@ def calculate_indicators(candles: CandleSeries) -> IndicatorSet:
     bb_width = _safe_divide(upper - lower, middle)
     volume_sma20 = talib.SMA(v, 20)
     relative_volume = _safe_divide(v, volume_sma20)
+    typical = (h + low + c) / 3.0
+    day = candles.timestamp // 86_400_000
+    vwap = np.full_like(c, np.nan, dtype=np.float64)
+    if len(c):
+        starts = np.r_[0, np.flatnonzero(np.diff(day)) + 1]
+        ends = np.r_[starts[1:], len(c)]
+        for start, end in zip(starts, ends, strict=True):
+            cumulative_volume = np.cumsum(v[start:end])
+            cumulative_value = np.cumsum(typical[start:end] * v[start:end])
+            vwap[start:end] = _safe_divide(cumulative_value, cumulative_volume)
     return IndicatorSet(
         ema20, ema50, ema100, ema200, sma50, sma200, adx, plus_di, minus_di,
         atr, normalized_atr, rsi, macd, macd_signal, macd_hist, stoch_k, stoch_d,
-        roc, cci, upper, middle, lower, bb_width, volume_sma20, relative_volume,
+        roc, cci, upper, middle, lower, bb_width, vwap, volume_sma20, relative_volume,
         talib.OBV(c, v), talib.MFI(h, low, c, v, 14), talib.AD(h, low, c, v),
     )
 

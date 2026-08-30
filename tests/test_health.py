@@ -17,6 +17,8 @@ async def test_health_endpoint_reports_runtime_state() -> None:
         "status": "ok",
         "scanner": "running",
         "exchange": "binance",
+        "ai": "disabled",
+        "scalp": "disabled",
         "last_scan_ms": 123,
         "scanned_symbols": 5,
         "scan_errors": 0,

@@ -73,6 +73,13 @@ def _targets(signal: Signal) -> str:
     return "\n".join(lines)
 
 
+def _ai_line(signal: Signal) -> str:
+    if signal.ai_review is None or signal.ai_review.verdict.value == "UNAVAILABLE":
+        return ""
+    reason = signal.ai_review.reasoning[0] if signal.ai_review.reasoning else "No additional contradiction found."
+    return f"\n🤖 *AI Review*  {signal.ai_review.verdict.value} — {reason[:110]}\n"
+
+
 def format_signal(signal: Signal) -> str:
     evidence = "\n".join(f"• {item[:60]}" for item in signal.evidence[:3])
     strategy = signal.strategy.replace("_", " ").title()
@@ -96,7 +103,8 @@ def format_signal(signal: Signal) -> str:
     return (
         f"🚨 *{signal.symbol} · {signal.direction.value}*\n"
         "*SETUP DETECTED · LIVE SETUP*\n"
-        f"{strategy} · {signal.grade.value} · Confluence {signal.score}/100"
+        f"{strategy} · {signal.mode.value} · {signal.grade.value}\n"
+        f"Setup {signal.score}/100 · Entry {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100"
         f"{supporting}\n\n"
         f"📍 *Current Price*  {_price(_current_price(signal))}\n\n"
         "🎯 *ENTRY*\n"
@@ -113,18 +121,21 @@ def format_signal(signal: Signal) -> str:
         f"🕐 *EXPIRES: {_expiry(signal)}*\n\n"
         f"✅ *VALID WHILE*\n{conditions}\n\n"
         f"🔎 *Confluence*\n{evidence}\n\n"
+        f"{_ai_line(signal)}"
         "🧮 *$5K Margin Simulation*\n"
         f"{simulation_text}\n\n"
-        "⚡ *Waiting for entry…*\n"
+        f"⚡ *{'Entry confirmed — awaiting trigger…' if signal.state.value == 'ENTRY_READY' else 'Waiting for retest and entry confirmation…'}*\n"
         "_Research only · fees, funding and slippage excluded._"
     )
 
 
 def format_watch(signal: Signal) -> str:
     return (
-        f"🟡 *{signal.symbol} · WATCH*\n"
-        f"*{signal.strategy.replace('_', ' ').title()}* · Confluence {signal.score}/100\n\n"
-        f"💹 *Current Price*\n{_price(_current_price(signal))} · latest closed 15M candle\n\n"
+        f"🟡 *{signal.symbol} · {signal.mode.value} WATCH*\n"
+        f"*Bias*  {(signal.directional_bias.direction.value if signal.directional_bias and signal.directional_bias.direction else signal.direction.value)}\n"
+        f"*{signal.strategy.replace('_', ' ').title()}*\n"
+        f"Setup {signal.score}/100 · Entry {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100\n\n"
+        f"💹 *Current Price*\n{_price(_current_price(signal))} · latest closed {signal.trading_timeframe.upper()} candle\n\n"
         "🔎 *Confirmation Needed*\n"
         f"{signal.trade.trigger}\n\n"
         f"🛑 *Invalidation*\n{_price(signal.trade.invalidation_level or signal.trade.stop_loss)}\n"
@@ -139,6 +150,17 @@ def format_lifecycle(signal: Signal) -> str:
     if signal.direction is Direction.SHORT:
         move *= -1
     timestamp = (signal.state_changed_at or signal.created_at).astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    if signal.state.value == "ENTRY_READY":
+        return (
+            "⚡ *ENTRY READY*\n"
+            f"*{signal.symbol} · {signal.direction.value} {signal.mode.value}*\n\n"
+            f"*Setup*  {strategy}\n"
+            f"*Entry Quality*  {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100\n"
+            f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
+            f"*Current Price*  {_price(price)}\n\n"
+            "Closed lower-timeframe retest and structure confirmation passed.\n"
+            "Waiting for the executable price trigger."
+        )
     if signal.state.value in {"ACTIVE", "ENTRY_TRIGGERED"}:
         trigger_price = signal.entry_trigger_price or price
         return (
@@ -152,7 +174,8 @@ def format_lifecycle(signal: Signal) -> str:
             f"🛡 *SL*  {_price(signal.trade.stop_loss)}\n"
             f"🎯 *TP1*  {_price(signal.trade.tp1)} · *TP2*  {_price(signal.trade.tp2)}\n"
             f"*Risk : Reward*  1:{signal.trade.reward_risk:.2f}\n\n"
-            f"📊 {strategy} · {signal.trading_timeframe.upper()} trade / {signal.analysis_timeframe.upper()} analysis\n"
+            f"📊 {strategy} · {signal.mode.value} · Entry quality {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100\n"
+            f"⏱ {signal.trading_timeframe.upper()} trade / {signal.analysis_timeframe.upper()} analysis\n"
             f"⏱ Triggered {_elapsed(signal)} after setup creation\n"
             f"🕐 {timestamp}"
         )
@@ -223,6 +246,13 @@ def format_stats(stats: PerformanceStats) -> str:
     win_rate = f"{stats.win_rate:.1f}%" if stats.win_rate is not None else "Awaiting resolved trades"
     average_hold = f"{stats.average_hold_hours:.1f}h" if stats.average_hold_hours is not None else "Not available"
     sample_note = "\n⚠️ Small sample—do not treat this WR as calibrated." if stats.resolved < 20 else ""
+    expectancy = f"{stats.expectancy_r:+.2f}R" if stats.expectancy_r is not None else "Awaiting resolved trades"
+    mae = f"{stats.median_mae_atr:.2f} ATR" if stats.median_mae_atr is not None else "Not available"
+    mode_lines = "\n".join(
+        f"• {mode}: {values['wins']}W/{values['losses']}L · "
+        + (f"{values['win_rate']:.1f}%" if isinstance(values.get("win_rate"), float) else "unresolved")
+        for mode, values in sorted(stats.by_mode.items())
+    ) or "• No mode samples yet"
     return (
         "📊 *Prism Performance*\n"
         f"{period} · TP1 counts as a win\n"
@@ -234,6 +264,10 @@ def format_stats(stats: PerformanceStats) -> str:
         f"*Open / TP1 Runners*  {stats.open_signals} / {stats.tp1_runners}\n"
         f"*Pre-entry Closures*  {stats.invalidated}\n"
         f"*Average Time to Outcome*  {average_hold}"
+        f"\n*Expectancy*  {expectancy}\n"
+        f"*Median MAE*  {mae}\n"
+        f"*Stopped Then 2R Reached*  {stats.stopped_then_target_reached}\n\n"
+        f"*By Mode*\n{mode_lines}"
         f"{sample_note}"
     )
 
@@ -276,6 +310,8 @@ def format_status(settings: Settings, health: RuntimeHealth) -> str:
         f"*Exchange*\n{health.exchange.title()}\n"
         f"*Delivery*\n{delivery}\n"
         f"*Outcome Store*\n{outcome_store}\n"
+        f"*AI Entry Review*\n{'Enabled' if settings.ai_analysis_enabled else 'Disabled'}\n"
+        f"*Scalp Engine*\n{'Enabled' if settings.scalp_enabled else 'Disabled'}\n"
         f"*Scan Cadence*\nEvery {_cadence(settings)}\n"
         f"*WATCH Alerts*\n{watch_alerts.title()}\n"
         f"*Last Completed Scan*\n{last_scan}\n"

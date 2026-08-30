@@ -253,3 +253,34 @@ def test_new_setup_sl_before_tp1_records_loss(tmp_path) -> None:
     assert stats.losses == 1
     assert stats.win_rate == 0
     ledger.close()
+
+
+def test_entry_analytics_and_stopped_then_target_survive_restart(tmp_path) -> None:
+    path = str(tmp_path / "analytics.db")
+    ledger = OutcomeLedger(path)
+    started = datetime.now(UTC)
+    active = replace(
+        make_signal(state=SignalState.ACTIVE),
+        id="analytics",
+        created_at=started,
+        state_changed_at=started,
+        activated_at=started,
+        atr_at_entry=2.0,
+        mae=1.5,
+        mfe=4.0,
+    )
+    assert ledger.record_signal(active)
+    stopped = transition(active, SignalState.STOPPED, current_price=95, changed_at=started + timedelta(hours=1))
+    stopped = replace(stopped, mae=5.0, mfe=4.0, stopped_then_target_reached=True)
+    assert ledger.record_event(stopped)
+    assert ledger.record_observation(stopped)
+    ledger.close()
+
+    reopened = OutcomeLedger(path)
+    stats = reopened.stats(now=started + timedelta(hours=2))
+    assert stats.median_mae_atr == 2.5
+    assert stats.median_mfe_atr == 2.0
+    assert stats.stopped_then_target_reached == 1
+    assert stats.expectancy_r == -1.0
+    assert stats.by_mode["INTRADAY"]["losses"] == 1
+    reopened.close()

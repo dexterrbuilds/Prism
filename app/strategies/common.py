@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.analysis.context import AnalysisContext
-from app.models import ConfluenceEvidence, Direction, SetupCandidate, SupportResistanceZone
+from app.models import ConfluenceEvidence, Direction, SetupCandidate, SignalMode, SupportResistanceZone
 
 
 def confirmation(context: AnalysisContext, direction: Direction) -> tuple[bool, list[str]]:
@@ -29,13 +29,15 @@ def candidate(
     quality: float,
     evidence: ConfluenceEvidence,
     confirmed: bool,
+    timeframe: str = "1h",
+    mode: SignalMode = SignalMode.INTRADAY,
     **metadata: float | str | bool,
 ) -> SetupCandidate:
     return SetupCandidate(
         symbol=context.snapshot.symbol,
         strategy=strategy,
         direction=direction,
-        timeframe="1h",
+        timeframe=timeframe,
         detected_at_ms=context.snapshot.as_of_ms,
         ideal_entry_low=min(zone_low, zone_high),
         ideal_entry_high=max(zone_low, zone_high),
@@ -45,6 +47,7 @@ def candidate(
         evidence=evidence,
         confirmed=confirmed,
         metadata=metadata,
+        mode=mode,
     )
 
 
