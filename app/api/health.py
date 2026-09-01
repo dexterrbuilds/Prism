@@ -16,6 +16,12 @@ class RuntimeHealth:
     scan_errors: int = 0
     last_scan_errors: int = 0
     last_error: str | None = None
+    candidates_detected: int = 0
+    signals_issued: int = 0
+    duplicate_candidates_suppressed: int = 0
+    reentries_issued: int = 0
+    same_symbol_concurrent_signals: int = 0
+    orphaned_signals_reconciled: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -41,6 +47,12 @@ def create_app(health: RuntimeHealth) -> FastAPI:
             "scan_errors": health.scan_errors,
             "last_scan_errors": health.last_scan_errors,
             "last_error": health.last_error,
+            "candidates_detected": health.candidates_detected,
+            "signals_issued": health.signals_issued,
+            "duplicate_candidates_suppressed": health.duplicate_candidates_suppressed,
+            "reentries_issued": health.reentries_issued,
+            "same_symbol_concurrent_signals": health.same_symbol_concurrent_signals,
+            "orphaned_signals_reconciled": health.orphaned_signals_reconciled,
         }
 
     return app

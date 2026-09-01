@@ -19,6 +19,7 @@ def test_signal_format_is_clean_compact_and_chart_caption_safe() -> None:
     message = format_signal(signal)
     assert "🚨 *BTC/USDT · LONG*" in message
     assert "SETUP DETECTED · LIVE SETUP" in message
+    assert "Signal `id`" in message
     assert "🎯 *ENTRY*" in message
     assert "🔎 *Confluence*" in message
     assert "🛡 *INVALIDATION*" in message
@@ -107,6 +108,19 @@ def test_tp1_lifecycle_alert_records_win_and_next_target() -> None:
     assert "TP1 HIT · WIN RECORDED" in message
     assert "Next objective" in message
     assert "TP1 is counted as a win" in message
+
+
+def test_ambiguous_lifecycle_alert_is_explicitly_unscored() -> None:
+    signal = replace(
+        make_signal(state=SignalState.AMBIGUOUS),
+        terminal_state=SignalState.AMBIGUOUS.value,
+        result="AMBIGUOUS",
+        lifecycle_reason="Stop and target were both touched inside one candle.",
+    )
+    message = format_lifecycle(signal)
+    assert "OUTCOME AMBIGUOUS" in message
+    assert "Excluded from win rate" in message
+    assert "Signal `id`" in message
 
 
 def test_stats_formatter_states_win_rule_and_sample_size() -> None:

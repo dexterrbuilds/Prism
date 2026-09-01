@@ -105,6 +105,10 @@ class SignalState(StrEnum):
     STOPPED = "STOPPED"
     INVALIDATED = "INVALIDATED"
     EXPIRED = "EXPIRED"
+    # A terminal, unscored outcome used when one candle contains both a stop
+    # and an unachieved target and no finer candle path establishes ordering.
+    AMBIGUOUS = "AMBIGUOUS"
+    CANCELLED = "CANCELLED"
 
 
 class SignalGrade(StrEnum):
@@ -361,6 +365,17 @@ class Signal:
     stopped_then_target_reached: bool = False
     follow_up_until: datetime | None = None
     directional_bias: DirectionalBias | None = None
+    # Lifecycle identity is always ``id``.  The fingerprint groups materially
+    # identical market opportunities without merging issued trade instances.
+    setup_fingerprint: str = ""
+    signal_type: str = "INITIAL"
+    parent_signal_id: str | None = None
+    setup_origin_at: datetime | None = None
+    major_structure_level: float | None = None
+    last_evaluated_at: datetime | None = None
+    terminal_state: str | None = None
+    terminal_at: datetime | None = None
+    result: str | None = None
 
     @staticmethod
     def utcnow() -> datetime:

@@ -7,6 +7,7 @@ import numpy as np
 from app.models import CandleSeries
 
 TIMEFRAME_MS = {
+    "1m": 60_000,
     "5m": 5 * 60_000,
     "15m": 15 * 60_000,
     "1h": 60 * 60_000,

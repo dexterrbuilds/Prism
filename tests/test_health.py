@@ -22,9 +22,15 @@ async def test_health_endpoint_reports_runtime_state() -> None:
         "last_scan_ms": 123,
         "scanned_symbols": 5,
         "scan_errors": 0,
-        "last_scan_errors": 0,
-        "last_error": None,
-    }
+            "last_scan_errors": 0,
+            "last_error": None,
+            "candidates_detected": 0,
+            "signals_issued": 0,
+            "duplicate_candidates_suppressed": 0,
+            "reentries_issued": 0,
+            "same_symbol_concurrent_signals": 0,
+            "orphaned_signals_reconciled": 0,
+        }
 
 
 @pytest.mark.asyncio

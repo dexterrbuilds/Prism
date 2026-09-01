@@ -69,6 +69,10 @@ async def test_lifecycle_monitor_emits_entry_only_once(monkeypatch: pytest.Monke
     monkeypatch.setenv("DRY_RUN", "true")
     telegram = FakeTelegram()
     scanner = Scanner(Settings.from_env(), FakeExchange(), telegram, RuntimeHealth("fake"))  # type: ignore[arg-type]
+    async def no_reconciliation(*, startup: bool = False) -> int:
+        del startup
+        return 0
+    scanner.reconcile_open_signals = no_reconciliation  # type: ignore[method-assign]
     from tests.test_lifecycle import make_waiting_signal
 
     now = datetime.now(UTC)

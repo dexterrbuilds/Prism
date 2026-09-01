@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from statistics import median
@@ -17,6 +18,17 @@ from app.signals.lifecycle import (
 from app.signals.outcomes import PerformanceStats, deserialize_signal, serialize_signal
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+def serialize_event_metadata(signal: Signal) -> str:
+    return json.dumps(
+        {
+            "state": signal.state.value,
+            "reason": signal.lifecycle_reason,
+            "setup_fingerprint": signal.setup_fingerprint,
+        },
+        separators=(",", ":"),
+    )
 
 
 class PostgresOutcomeRepository:
@@ -77,6 +89,10 @@ class PostgresOutcomeRepository:
     def _metadata(self) -> str:
         return f'"{self._schema}".metadata'
 
+    @property
+    def _events(self) -> str:
+        return f'"{self._schema}".signal_events'
+
     async def _initialize(self) -> None:
         async with self._pool.acquire() as connection:
             await connection.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
@@ -113,13 +129,49 @@ class PostgresOutcomeRepository:
                     mfe DOUBLE PRECISION NOT NULL DEFAULT 0,
                     stopped_then_target_reached BOOLEAN NOT NULL DEFAULT FALSE,
                     follow_up_until TIMESTAMPTZ,
+                    setup_fingerprint TEXT,
+                    signal_type TEXT NOT NULL DEFAULT 'INITIAL',
+                    parent_signal_id TEXT,
+                    setup_origin_at TIMESTAMPTZ,
+                    major_structure_level DOUBLE PRECISION,
+                    last_evaluated_at TIMESTAMPTZ,
+                    terminal_state TEXT,
+                    terminal_at TIMESTAMPTZ,
+                    result TEXT,
                     win BOOLEAN NOT NULL DEFAULT FALSE,
                     payload JSONB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS {self._events} (
+                    event_id TEXT PRIMARY KEY,
+                    signal_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_at TIMESTAMPTZ NOT NULL,
+                    price DOUBLE PRECISION,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    UNIQUE(signal_id, event_type)
                 );
                 CREATE INDEX IF NOT EXISTS idx_prism_outcomes_created
                     ON {self._outcomes}(created_at);
                 CREATE INDEX IF NOT EXISTS idx_prism_outcomes_state
                     ON {self._outcomes}(state);
+                """
+            )
+            # Create one immutable server-side safety copy before the additive
+            # identity migration.  Existing backups are never overwritten.
+            await connection.execute(
+                f"""
+                DO $migration$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = '{self._schema}'
+                          AND table_name = 'signal_outcomes'
+                          AND column_name = 'setup_fingerprint'
+                    ) THEN
+                        EXECUTE 'CREATE TABLE IF NOT EXISTS "{self._schema}".signal_outcomes_pre_identity_v3_backup AS TABLE {self._outcomes}';
+                    END IF;
+                END
+                $migration$;
                 """
             )
             await connection.execute(
@@ -136,13 +188,39 @@ class PostgresOutcomeRepository:
                     ADD COLUMN IF NOT EXISTS mae DOUBLE PRECISION NOT NULL DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS mfe DOUBLE PRECISION NOT NULL DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS stopped_then_target_reached BOOLEAN NOT NULL DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS follow_up_until TIMESTAMPTZ
+                    ADD COLUMN IF NOT EXISTS follow_up_until TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS setup_fingerprint TEXT,
+                    ADD COLUMN IF NOT EXISTS signal_type TEXT NOT NULL DEFAULT 'INITIAL',
+                    ADD COLUMN IF NOT EXISTS parent_signal_id TEXT,
+                    ADD COLUMN IF NOT EXISTS setup_origin_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS major_structure_level DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS terminal_state TEXT,
+                    ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS result TEXT
                 """
             )
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_mode ON {self._outcomes}(mode)")
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_strategy ON {self._outcomes}(strategy)")
+            await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_setup ON {self._outcomes}(setup_fingerprint)")
+            await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_symbol_state ON {self._outcomes}(symbol, state)")
+            await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_events_signal ON {self._events}(signal_id, event_at)")
             await connection.execute(
-                f"INSERT INTO {self._metadata}(key, value) VALUES ('tracking_started_at', $1) ON CONFLICT (key) DO NOTHING",
+                f"""
+                INSERT INTO {self._events}(event_id, signal_id, event_type, event_at, price, metadata)
+                SELECT signal_id || ':MIGRATED_SNAPSHOT', signal_id, 'MIGRATED_SNAPSHOT',
+                       updated_at, current_price, jsonb_build_object('state', state)
+                FROM {self._outcomes}
+                ON CONFLICT DO NOTHING
+                """
+            )
+            await connection.execute(
+                f"""
+                INSERT INTO {self._metadata}(key, value)
+                SELECT 'tracking_started_at', COALESCE(MIN(created_at), $1)
+                FROM {self._outcomes}
+                ON CONFLICT (key) DO NOTHING
+                """,
                 datetime.now(UTC),
             )
 
@@ -159,9 +237,13 @@ class PostgresOutcomeRepository:
                 signal_id, created_at, updated_at, state, symbol, strategy,
                 direction, score, current_price, activated_at, expires_at,
                 entry_trigger_price, mode, entry_quality_score, atr_at_entry,
-                mae, mfe, stopped_then_target_reached, follow_up_until, payload
+                mae, mfe, stopped_then_target_reached, follow_up_until,
+                setup_fingerprint, signal_type, parent_signal_id, setup_origin_at,
+                major_structure_level, last_evaluated_at, terminal_state,
+                terminal_at, result, payload
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                      $13, $14, $15, $16, $17, $18, $19, $20::jsonb)
+                      $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                      $23, $24, $25, $26, $27, $28, $29::jsonb)
             ON CONFLICT (signal_id) DO NOTHING
             """,
             signal.id,
@@ -183,7 +265,42 @@ class PostgresOutcomeRepository:
             signal.mfe,
             signal.stopped_then_target_reached,
             signal.follow_up_until,
+            signal.setup_fingerprint,
+            signal.signal_type,
+            signal.parent_signal_id,
+            signal.setup_origin_at,
+            signal.major_structure_level,
+            signal.last_evaluated_at,
+            signal.terminal_state,
+            signal.terminal_at,
+            signal.result,
             serialize_signal(signal),
+        )
+        inserted = result == "INSERT 0 1"
+        if inserted:
+            await self._insert_event(connection, signal, "CREATED", signal.created_at)
+        return inserted
+
+    async def _insert_event(
+        self,
+        connection: asyncpg.Connection,
+        signal: Signal,
+        event_type: str,
+        event_at: datetime,
+    ) -> bool:
+        result: str = await connection.execute(
+            f"""
+            INSERT INTO {self._events}(
+                event_id, signal_id, event_type, event_at, price, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            ON CONFLICT (signal_id, event_type) DO NOTHING
+            """,
+            f"{signal.id}:{event_type}",
+            signal.id,
+            event_type,
+            event_at,
+            signal.current_price,
+            serialize_event_metadata(signal),
         )
         return result == "INSERT 0 1"
 
@@ -234,6 +351,15 @@ class PostgresOutcomeRepository:
                 "mfe = $12",
                 "stopped_then_target_reached = $13",
                 "follow_up_until = $14",
+                "setup_fingerprint = $15",
+                "signal_type = $16",
+                "parent_signal_id = $17",
+                "setup_origin_at = $18",
+                "major_structure_level = $19",
+                "last_evaluated_at = $20",
+                "terminal_state = $21",
+                "terminal_at = $22",
+                "result = $23",
             ]
             values: list[Any] = [
                 signal.id,
@@ -250,12 +376,23 @@ class PostgresOutcomeRepository:
                 signal.mfe,
                 signal.stopped_then_target_reached,
                 signal.follow_up_until,
+                signal.setup_fingerprint,
+                signal.signal_type,
+                signal.parent_signal_id,
+                signal.setup_origin_at,
+                signal.major_structure_level,
+                signal.last_evaluated_at,
+                signal.terminal_state,
+                signal.terminal_at,
+                signal.result,
             ]
             for field in timestamp_fields.get(signal.state, ()):
                 values.append(event_at)
                 assignments.append(f"{field} = COALESCE({field}, ${len(values)})")
             if signal.state in {SignalState.TP1_HIT, SignalState.TP2_HIT}:
                 assignments.append("win = TRUE")
+            if not await self._insert_event(connection, signal, signal.state.value, event_at):
+                return False
             await connection.execute(
                 f"UPDATE {self._outcomes} SET {', '.join(assignments)} WHERE signal_id = $1",
                 *values,
@@ -269,7 +406,8 @@ class PostgresOutcomeRepository:
                 UPDATE {self._outcomes}
                 SET updated_at = $2, current_price = $3, mae = $4, mfe = $5,
                     stopped_then_target_reached = $6, follow_up_until = $7,
-                    payload = $8::jsonb
+                    last_evaluated_at = $8, terminal_state = $9,
+                    terminal_at = $10, result = $11, payload = $12::jsonb
                 WHERE signal_id = $1
                 """,
                 signal.id,
@@ -279,9 +417,27 @@ class PostgresOutcomeRepository:
                 signal.mfe,
                 signal.stopped_then_target_reached,
                 signal.follow_up_until,
+                signal.last_evaluated_at,
+                signal.terminal_state,
+                signal.terminal_at,
+                signal.result,
                 serialize_signal(signal),
             )
         return result == "UPDATE 1"
+
+    async def load_signal(self, signal_id: str) -> Signal | None:
+        """Load one exact immutable signal instance, including terminal rows."""
+        async with self._pool.acquire() as connection:
+            payload = await connection.fetchval(
+                f"SELECT payload::text FROM {self._outcomes} WHERE signal_id = $1",
+                signal_id,
+            )
+        if payload is None:
+            return None
+        try:
+            return deserialize_signal(str(payload))
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def load_open_signals(self) -> tuple[Signal, ...]:
         async with self._pool.acquire() as connection:
@@ -437,32 +593,16 @@ class PostgresOutcomeRepository:
                 else None
             ),
             stopped_then_target_reached=sum(bool(row["stopped_then_target_reached"]) for row in rows),
+            ambiguous=sum(row["state"] == SignalState.AMBIGUOUS.value for row in rows),
             by_mode=by_mode,
             breakdowns=breakdowns,
         )
 
     async def _prune(self, connection: asyncpg.Connection) -> None:
-        count = int(await connection.fetchval(f"SELECT COUNT(*) FROM {self._outcomes}"))
-        excess = max(0, count - self._history_limit)
-        if not excess:
-            return
-        await connection.execute(
-            f"""
-            DELETE FROM {self._outcomes} WHERE signal_id IN (
-                SELECT signal_id FROM {self._outcomes}
-                WHERE state = ANY($1::text[]) ORDER BY created_at ASC LIMIT $2
-            )
-            """,
-            [
-                SignalState.TP2_HIT.value,
-                SignalState.STOPPED.value,
-                SignalState.SL_HIT.value,
-                SignalState.MISSED.value,
-                SignalState.INVALIDATED.value,
-                SignalState.EXPIRED.value,
-            ],
-            excess,
-        )
+        del connection
+        # Durable performance history is append-only.  Memory remains bounded
+        # independently by SignalStore.
+        return
 
     async def close(self) -> None:
         await self._pool.close()

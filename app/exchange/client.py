@@ -77,6 +77,37 @@ class ExchangeClient:
         self._cache[key] = _CacheItem(time.monotonic(), value)
         return value
 
+    async def fetch_ohlcv_page(
+        self,
+        symbol: str,
+        timeframe: str,
+        since_ms: int,
+        as_of_ms: int,
+        *,
+        limit: int = 250,
+    ) -> CandleSeries:
+        """Fetch one bounded historical page for an explicit maintenance job.
+
+        This path deliberately bypasses the routine scan cache.  It never asks
+        the exchange for more than 250 rows and therefore does not change the
+        scanner's normal ``CANDLE_LIMIT`` or memory profile.
+        """
+        page_limit = max(1, min(250, int(limit)))
+
+        async def operation() -> list[list[float]]:
+            rows = await self._client.fetch_ohlcv(
+                self._futures_symbol(symbol),
+                timeframe=timeframe,
+                since=int(since_ms),
+                limit=page_limit,
+            )
+            if not isinstance(rows, list):
+                raise ExchangeRequestError("malformed historical OHLCV response")
+            return rows
+
+        rows = await self._request(f"fetch_ohlcv_page:{symbol}:{timeframe}", operation)
+        return from_ccxt_rows(symbol, timeframe, rows, as_of_ms)
+
     async def fetch_prices(self, symbols: tuple[str, ...]) -> dict[str, float]:
         """Fetch one lightweight price snapshot for open setup monitoring."""
         if not symbols:

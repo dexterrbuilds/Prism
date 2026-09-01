@@ -67,6 +67,13 @@ async def run() -> None:
             await exchange.load_markets()
         except ExchangeRequestError as exc:
             logger.warning("exchange_start_failure error=%s", exc)
+        else:
+            try:
+                await scanner.reconcile_open_signals(startup=True)
+            except Exception as exc:
+                # Reconciliation is recoverable and will retry during the
+                # lifecycle monitor; startup must remain available.
+                logger.warning("startup_reconciliation_failure error=%s", type(exc).__name__)
         active_scanner_task = asyncio.create_task(scanner.run(stop_event), name="scanner")
         scanner_task = active_scanner_task
         stop_task = asyncio.create_task(stop_event.wait(), name="shutdown-wait")

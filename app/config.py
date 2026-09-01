@@ -70,6 +70,10 @@ class Settings:
     ai_timeout_seconds: float
     ai_cache_size: int
     dry_run_track_outcomes: bool
+    signal_dedup_window_minutes: int
+    signal_dedup_entry_atr: float
+    signal_dedup_stop_atr: float
+    signal_dedup_target_atr: float
 
     @property
     def telegram_delivery_ids(self) -> tuple[str, ...]:
@@ -134,6 +138,18 @@ class Settings:
             ai_timeout_seconds=max(1.0, min(30.0, float(os.getenv("AI_TIMEOUT_SECONDS", "8")))),
             ai_cache_size=max(8, min(512, int(os.getenv("AI_CACHE_SIZE", "128")))),
             dry_run_track_outcomes=_bool("DRY_RUN_TRACK_OUTCOMES", True),
+            signal_dedup_window_minutes=max(
+                15, min(10_080, int(os.getenv("SIGNAL_DEDUP_WINDOW_MINUTES", "360")))
+            ),
+            signal_dedup_entry_atr=max(
+                0.05, min(2.0, float(os.getenv("SIGNAL_DEDUP_ENTRY_ATR", "0.20")))
+            ),
+            signal_dedup_stop_atr=max(
+                0.05, min(3.0, float(os.getenv("SIGNAL_DEDUP_STOP_ATR", "0.25")))
+            ),
+            signal_dedup_target_atr=max(
+                0.05, min(3.0, float(os.getenv("SIGNAL_DEDUP_TARGET_ATR", "0.25")))
+            ),
         )
 
     def validate(self) -> None:
@@ -151,3 +167,14 @@ class Settings:
             raise ValueError("DATABASE_SCHEMA must be a lowercase PostgreSQL identifier")
         if self.ai_analysis_enabled and self.ai_provider not in {"openai_compatible"}:
             raise ValueError("AI_PROVIDER must be 'openai_compatible'")
+
+    def validate_maintenance(self) -> None:
+        """Validate exchange/database settings without requiring Telegram delivery."""
+        if self.exchange not in {"binance", "bybit"}:
+            raise ValueError("EXCHANGE must be 'binance' or 'bybit'")
+        if self.outcome_backend not in {"auto", "sqlite", "postgres"}:
+            raise ValueError("OUTCOME_BACKEND must be 'auto', 'sqlite', or 'postgres'")
+        if self.resolved_outcome_backend == "postgres" and not self.database_url:
+            raise ValueError("DATABASE_URL is required when OUTCOME_BACKEND=postgres")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.database_schema):
+            raise ValueError("DATABASE_SCHEMA must be a lowercase PostgreSQL identifier")

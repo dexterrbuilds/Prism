@@ -31,6 +31,8 @@ class OutcomeRepository(Protocol):
 
     async def record_observation(self, signal: Signal) -> bool: ...
 
+    async def load_signal(self, signal_id: str) -> Signal | None: ...
+
     async def load_open_signals(self) -> Sequence[Signal]: ...
 
     async def stats(self, period_days: int | None = None) -> PerformanceStats: ...
@@ -69,6 +71,11 @@ class SQLiteOutcomeRepository:
 
     async def record_observation(self, signal: Signal) -> bool:
         return bool(await self._call("record_observation", signal))
+
+    async def load_signal(self, signal_id: str) -> Signal | None:
+        result = await self._call("load_signal", signal_id)
+        assert result is None or isinstance(result, Signal)
+        return result
 
     async def load_open_signals(self) -> Sequence[Signal]:
         result = await self._call("load_open_signals")

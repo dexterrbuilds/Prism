@@ -5,11 +5,10 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 
 from app.ai.analyst import AIReviewService
 from app.analysis.bias import derive_directional_bias
-from app.analysis.context import analyze_snapshot
+from app.analysis.context import AnalysisContext, analyze_snapshot
 from app.analysis.data_quality import validate_candles
 from app.api.health import RuntimeHealth
 from app.config import Settings
@@ -28,7 +27,12 @@ from app.models import (
 )
 from app.signals.entry_plan import calculate_entry_plan
 from app.signals.entry_quality import score_entry_quality, two_gate_result
-from app.signals.lifecycle import SignalStore, transition
+from app.signals.lifecycle import (
+    SignalStore,
+    build_setup_fingerprint,
+    create_signal_id,
+    transition,
+)
 from app.signals.repository import OutcomeRepository
 from app.signals.risk import RiskPlanningError, build_trade_plan
 from app.signals.scoring import score_candidate
@@ -47,6 +51,27 @@ logger = logging.getLogger(__name__)
 class SymbolScanResult:
     success: bool
     error: str | None = None
+
+
+def _setup_origin(candidate: SetupCandidate, context: AnalysisContext, primary_tf: str) -> tuple[float, int | None]:
+    """Return the nearest confirmed structural anchor and its stable candle timestamp."""
+    analysis = context.timeframes[primary_tf]
+    candles = context.snapshot.series[primary_tf]
+    midpoint = (candidate.ideal_entry_low + candidate.ideal_entry_high) / 2
+    anchors: list[tuple[float, float, int]] = []
+    for event in analysis.structure.events:
+        if event.direction is candidate.direction and 0 <= event.index < len(candles):
+            anchors.append((abs(event.level - midpoint), event.level, int(candles.timestamp[event.index])))
+    for swing in analysis.structure.swings:
+        if 0 <= swing.index < len(candles):
+            anchors.append((abs(swing.price - midpoint), swing.price, int(candles.timestamp[swing.index])))
+    for zone in analysis.zones:
+        if 0 <= zone.last_index < len(candles):
+            anchors.append((abs(zone.midpoint - midpoint), zone.midpoint, int(candles.timestamp[zone.last_index])))
+    if not anchors:
+        return midpoint, None
+    _, level, timestamp = min(anchors, key=lambda item: item[0])
+    return level, timestamp
 
 
 def select_best_signal(signals: list[Signal], ambiguity_buffer: int = 5) -> Signal | None:
@@ -120,7 +145,70 @@ class Scanner:
         restored = await self.outcomes.load_open_signals()
         for signal in restored:
             self.store.restore(signal)
-        logger.info("signal_outcomes_restored count=%d", len(restored))
+        logger.info(
+            "signal_outcomes_restored count=%d unique_symbols=%d signal_ids=%s",
+            len(restored),
+            len({signal.symbol for signal in restored}),
+            ",".join(signal.id for signal in restored[:12]),
+        )
+
+    async def reconcile_open_signals(self, *, startup: bool = False) -> int:
+        """Replay closed execution candles for every persisted non-terminal instance."""
+        signals = self.store.open_signals()
+        pairs = tuple(dict.fromkeys((signal.symbol, signal.trading_timeframe) for signal in signals))
+        if not pairs:
+            return 0
+        as_of_ms = int(time.time() * 1000)
+        fetched = await asyncio.gather(
+            *(self.exchange.fetch_ohlcv(symbol, timeframe, as_of_ms) for symbol, timeframe in pairs),
+            return_exceptions=True,
+        )
+        reconciled_events = 0
+        reconciled_ids: set[str] = set()
+        for (symbol, timeframe), result in zip(pairs, fetched, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "signal_reconciliation_failure symbol=%s timeframe=%s error=%s",
+                    symbol,
+                    timeframe,
+                    type(result).__name__,
+                )
+                continue
+            quality = validate_candles(result)
+            if not quality.valid:
+                logger.warning(
+                    "signal_reconciliation_failure symbol=%s timeframe=%s reason=data_quality",
+                    symbol,
+                    timeframe,
+                )
+                continue
+            timeframe_ms = 300_000 if timeframe == "5m" else 900_000
+            events = self.store.track_candles(
+                symbol,
+                result.timestamp,
+                result.high,
+                result.low,
+                result.close,
+                timeframe_ms=timeframe_ms,
+                trading_timeframe=timeframe,
+            )
+            if events:
+                reconciled_events += len(events)
+                reconciled_ids.update(event.id for event in events)
+                await self._publish_lifecycle_events(events, symbol)
+            if self.outcomes is not None and (not self.settings.dry_run or self.settings.dry_run_track_outcomes):
+                for tracked in self.store.signals_for_symbol(symbol):
+                    await self.outcomes.record_observation(tracked)
+        if startup and reconciled_ids:
+            self.health.orphaned_signals_reconciled += len(reconciled_ids)
+        logger.info(
+            "signal_reconciliation_completed startup=%s instances=%d reconciled_signals=%d transitions=%d",
+            startup,
+            len(signals),
+            len(reconciled_ids),
+            reconciled_events,
+        )
+        return len(reconciled_ids)
 
     def request_manual_scan(self) -> bool:
         """Wake the scanner once; never overlap an active watchlist scan."""
@@ -160,6 +248,7 @@ class Scanner:
         if not symbols:
             return
         await self._refresh_entry_readiness(observed_at)
+        await self.reconcile_open_signals()
         try:
             prices = await self.exchange.fetch_prices(symbols)
         except Exception as exc:
@@ -243,11 +332,11 @@ class Scanner:
                     if review.verdict in {AIReviewVerdict.WAIT, AIReviewVerdict.REJECT}:
                         continue
                 ready = self.store.mark_entry_ready(
-                    signal.symbol,
-                    signal.direction,
+                    signal.id,
                     quality,
                     observed_at=observed_at,
                     current_price=series[execution_tf].latest_close,
+                    minimum_score=minimum,
                 )
                 if ready is not None:
                     await self._publish_lifecycle_events([ready], signal.symbol)
@@ -257,7 +346,8 @@ class Scanner:
     async def _publish_lifecycle_events(self, events: list[Signal], symbol: str) -> None:
         for event in events:
             logger.info(
-                "signal_lifecycle symbol=%s strategy=%s state=%s",
+                "signal_lifecycle signal_id=%s symbol=%s strategy=%s state=%s",
+                event.id,
                 event.symbol,
                 event.strategy,
                 event.state.value,
@@ -267,7 +357,8 @@ class Scanner:
                 publish_event = await self.outcomes.record_event(event)
             if not publish_event:
                 logger.info(
-                    "signal_lifecycle_duplicate_suppressed symbol=%s state=%s",
+                    "signal_lifecycle_duplicate_suppressed signal_id=%s symbol=%s state=%s",
+                    event.id,
                     event.symbol,
                     event.state.value,
                 )
@@ -356,6 +447,7 @@ class Scanner:
             counter = evaluate_counter_setup(previous, context)
             if counter is not None:
                 candidates.append(counter)
+        self.health.candidates_detected += len(candidates)
         if not candidates:
             logger.info("setup_rejected symbol=%s reason=%s", symbol, RejectionReason.NO_SETUP.value)
         valid_signals: list[Signal] = []
@@ -406,8 +498,6 @@ class Scanner:
                 continue
             ready = gate.actionable and entry_quality.retest_completed and entry_quality.lower_timeframe_confirmed
             state = SignalState.ENTRY_READY if ready else SignalState.WAITING_FOR_ENTRY
-            bucket_ms = 300_000 if candidate.mode is SignalMode.SCALP else 3_600_000
-            raw_id = f"{symbol}|{candidate.mode.value}|{candidate.strategy}|{candidate.direction.value}|{candidate.detected_at_ms // bucket_ms}"
             created_at = datetime.fromtimestamp(as_of_ms / 1000, UTC)
             validity_minutes = derive_setup_validity_minutes(candidate, plan)
             expires_at = created_at + timedelta(minutes=validity_minutes)
@@ -421,13 +511,32 @@ class Scanner:
                 if candidate.direction is Direction.LONG
                 else plan.entry_zone_low - missed_distance
             )
+            major_structure_level, setup_origin_ms = _setup_origin(candidate, context, primary_tf)
+            setup_origin_at = (
+                datetime.fromtimestamp(setup_origin_ms / 1000, UTC)
+                if setup_origin_ms is not None
+                else None
+            )
+            setup_fingerprint = build_setup_fingerprint(
+                symbol=symbol,
+                direction=candidate.direction,
+                mode=candidate.mode,
+                strategy=candidate.strategy,
+                regime=context.regime.value,
+                entry_low=plan.entry_zone_low,
+                entry_high=plan.entry_zone_high,
+                invalidation=invalidation_level,
+                major_structure_level=major_structure_level,
+                atr=atr,
+                setup_origin_ms=setup_origin_ms,
+            )
             valid_conditions = (
                 f"Price remains {relation} {invalidation_level:.8g}",
                 f"Price does not close {missed_relation} {missed_limit:.8g} before entry",
                 f"Entry triggers before {expires_at.strftime('%H:%M UTC')}",
             )
             signal = Signal(
-                id=sha256(raw_id.encode()).hexdigest()[:20], symbol=symbol, strategy=candidate.strategy,
+                id=create_signal_id(symbol, candidate.direction, created_at), symbol=symbol, strategy=candidate.strategy,
                 direction=candidate.direction, regime=context.regime, score=score.total, grade=score.grade,
                 state=state,
                 trade=plan,
@@ -445,6 +554,10 @@ class Scanner:
                 entry_quality=entry_quality,
                 atr_at_entry=float(context.timeframes[execution_tf].indicators.atr[-1]),
                 directional_bias=directional_bias,
+                setup_fingerprint=setup_fingerprint,
+                setup_origin_at=setup_origin_at,
+                major_structure_level=major_structure_level,
+                last_evaluated_at=created_at,
             )
             if self.ai_reviews is not None and self.ai_reviews.enabled:
                 review = await self.ai_reviews.review(signal)
@@ -470,19 +583,50 @@ class Scanner:
             persistence_enabled = self.outcomes is not None and (
                 not self.settings.dry_run or self.settings.dry_run_track_outcomes
             )
-            persisted_duplicate = (
-                persistence_enabled
-                and self.outcomes is not None
-                and await self.outcomes.contains_signal(selected.id)
+            duplicate = self.store.find_duplicate(
+                selected,
+                window_minutes=self.settings.signal_dedup_window_minutes,
+                entry_atr=self.settings.signal_dedup_entry_atr,
+                stop_atr=self.settings.signal_dedup_stop_atr,
+                target_atr=self.settings.signal_dedup_target_atr,
             )
-            if persisted_duplicate:
-                logger.info("signal_duplicate_suppressed symbol=%s signal_id=%s", symbol, selected.id)
-            elif self.store.should_publish(selected):
+            if duplicate is not None:
+                self.health.duplicate_candidates_suppressed += 1
+                logger.info(
+                    "duplicate_candidate_suppressed candidate_id=%s existing_signal_id=%s "
+                    "symbol=%s setup_fingerprint=%s reason=%s",
+                    selected.id,
+                    duplicate.signal.id,
+                    symbol,
+                    selected.setup_fingerprint,
+                    duplicate.reason,
+                )
+            else:
+                parent = self.store.find_reentry_parent(selected)
+                if parent is not None:
+                    selected = replace(
+                        selected,
+                        signal_type="RE_ENTRY",
+                        parent_signal_id=parent.id,
+                    )
+                    self.health.reentries_issued += 1
+                if self.store.concurrent_open_count(symbol):
+                    self.health.same_symbol_concurrent_signals += 1
+                self.store.restore(selected)
                 if persistence_enabled and self.outcomes is not None:
                     inserted = await self.outcomes.record_signal(selected)
                     if not inserted:
-                        logger.info("signal_duplicate_suppressed symbol=%s signal_id=%s", symbol, selected.id)
+                        self.store.discard(selected.id)
+                        logger.info("signal_id_collision_suppressed symbol=%s signal_id=%s", symbol, selected.id)
                         return SymbolScanResult(True)
+                self.health.signals_issued += 1
+                logger.info(
+                    "signal_instance_issued signal_id=%s setup_fingerprint=%s type=%s parent_signal_id=%s",
+                    selected.id,
+                    selected.setup_fingerprint,
+                    selected.signal_type,
+                    selected.parent_signal_id or "none",
+                )
                 chart_png: bytes | None = None
                 try:
                     chart_png = render_signal_chart(

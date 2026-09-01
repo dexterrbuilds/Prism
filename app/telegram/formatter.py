@@ -26,6 +26,10 @@ def _current_price(signal: Signal) -> float:
     return signal.current_price if signal.current_price is not None else signal.trade.preferred_entry
 
 
+def _signal_ref(signal: Signal) -> str:
+    return signal.id if len(signal.id) <= 18 else signal.id[-10:]
+
+
 def _hold_time(signal: Signal) -> str:
     if signal.activated_at is None or signal.state_changed_at is None:
         return "Not available"
@@ -104,6 +108,7 @@ def format_signal(signal: Signal) -> str:
         f"🚨 *{signal.symbol} · {signal.direction.value}*\n"
         "*SETUP DETECTED · LIVE SETUP*\n"
         f"{strategy} · {signal.mode.value} · {signal.grade.value}\n"
+        f"Signal `{_signal_ref(signal)}` · {signal.signal_type.replace('_', ' ').title()}\n"
         f"Setup {signal.score}/100 · Entry {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100"
         f"{supporting}\n\n"
         f"📍 *Current Price*  {_price(_current_price(signal))}\n\n"
@@ -132,6 +137,7 @@ def format_signal(signal: Signal) -> str:
 def format_watch(signal: Signal) -> str:
     return (
         f"🟡 *{signal.symbol} · {signal.mode.value} WATCH*\n"
+        f"Signal `{_signal_ref(signal)}`\n"
         f"*Bias*  {(signal.directional_bias.direction.value if signal.directional_bias and signal.directional_bias.direction else signal.direction.value)}\n"
         f"*{signal.strategy.replace('_', ' ').title()}*\n"
         f"Setup {signal.score}/100 · Entry {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100\n\n"
@@ -154,6 +160,7 @@ def format_lifecycle(signal: Signal) -> str:
         return (
             "⚡ *ENTRY READY*\n"
             f"*{signal.symbol} · {signal.direction.value} {signal.mode.value}*\n\n"
+            f"Signal `{_signal_ref(signal)}`\n"
             f"*Setup*  {strategy}\n"
             f"*Entry Quality*  {signal.entry_quality.total if signal.entry_quality else 'N/A'}/100\n"
             f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
@@ -167,6 +174,7 @@ def format_lifecycle(signal: Signal) -> str:
             "🟢 *ENTRY TRIGGERED*\n"
             f"*{signal.symbol} · {signal.direction.value}*\n"
             "Status: *ACTIVE*\n\n"
+            f"Signal `{_signal_ref(signal)}`\n"
             f"📍 *Current Price*  {_price(price)}\n"
             f"*Actual Trigger*  {_price(trigger_price)}\n"
             f"*Entry Zone*  {_price(signal.trade.entry_zone_low)} – {_price(signal.trade.entry_zone_high)}\n"
@@ -188,6 +196,7 @@ def format_lifecycle(signal: Signal) -> str:
         return (
             f"{'🏆' if tp2 else '🎯'} *{title}*\n"
             f"*{signal.symbol} · {signal.direction.value}* · {strategy}\n\n"
+            f"Signal `{_signal_ref(signal)}`\n"
             f"*Target*  {_price(target)}\n"
             f"*Current Price*  {_price(price)}\n"
             f"*Move from Entry*  {move:+.2f}%\n"
@@ -201,12 +210,23 @@ def format_lifecycle(signal: Signal) -> str:
         return (
             f"🛑 *{'RUNNER CLOSED' if won else 'STOP LOSS HIT'}*\n"
             f"*{signal.symbol} · {signal.direction.value}* · {strategy}\n\n"
+            f"Signal `{_signal_ref(signal)}`\n"
             f"*Stop*  {_price(signal.trade.stop_loss)}\n"
             f"*Current Price*  {_price(price)}\n"
             f"*Outcome*  {'TP1 win remains recorded' if won else 'Loss recorded'}\n"
             f"*Hold*  {_hold_time(signal)} · {timestamp}"
         )
     reason = signal.lifecycle_reason or "The setup is no longer actionable."
+    if signal.state.value == "AMBIGUOUS":
+        return (
+            "⚖️ *OUTCOME AMBIGUOUS*\n"
+            f"*{signal.symbol} · {signal.direction.value}* · {strategy}\n"
+            f"Signal `{_signal_ref(signal)}`\n\n"
+            f"*Candle Price*  {_price(price)}\n"
+            f"*Stop*  {_price(signal.trade.stop_loss)} · *TP1*  {_price(signal.trade.tp1)}\n\n"
+            f"*Reason*\n{reason}\n\n"
+            "_Excluded from win rate unless an earlier TP1 win was already established._"
+        )
     if signal.state.value == "MISSED":
         return (
             "⚪ *SETUP MISSED*\n"
@@ -267,6 +287,7 @@ def format_stats(stats: PerformanceStats) -> str:
         f"\n*Expectancy*  {expectancy}\n"
         f"*Median MAE*  {mae}\n"
         f"*Stopped Then 2R Reached*  {stats.stopped_then_target_reached}\n\n"
+        f"*Ambiguous / Unscored*  {stats.ambiguous}\n\n"
         f"*By Mode*\n{mode_lines}"
         f"{sample_note}"
     )
@@ -318,5 +339,8 @@ def format_status(settings: Settings, health: RuntimeHealth) -> str:
         f"*Symbols Completed*\n{health.scanned_symbols}/{len(settings.watchlist)}\n"
         f"*Last Scan Errors*\n{health.last_scan_errors}\n"
         f"*Cumulative Scan Errors*\n{health.scan_errors}"
+        f"\n*Signal Identity Metrics*\n"
+        f"{health.signals_issued} issued · {health.duplicate_candidates_suppressed} duplicates suppressed · "
+        f"{health.orphaned_signals_reconciled} reconciled"
         + (f"\n*Latest Error*\n{health.last_error.replace('_', ' ')[:240]}" if health.last_error else "")
     )

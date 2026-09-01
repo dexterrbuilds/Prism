@@ -37,6 +37,18 @@ def test_lifecycle_monitor_cadence_is_environment_configurable(monkeypatch: pyte
     assert settings.lifecycle_monitor_seconds == 45
 
 
+def test_signal_similarity_thresholds_are_environment_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNAL_DEDUP_WINDOW_MINUTES", "180")
+    monkeypatch.setenv("SIGNAL_DEDUP_ENTRY_ATR", "0.15")
+    monkeypatch.setenv("SIGNAL_DEDUP_STOP_ATR", "0.20")
+    monkeypatch.setenv("SIGNAL_DEDUP_TARGET_ATR", "0.30")
+    settings = Settings.from_env()
+    assert settings.signal_dedup_window_minutes == 180
+    assert settings.signal_dedup_entry_atr == 0.15
+    assert settings.signal_dedup_stop_atr == 0.20
+    assert settings.signal_dedup_target_atr == 0.30
+
+
 def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)
@@ -51,12 +63,29 @@ def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        INSERT INTO signal_outcomes(
+            signal_id, created_at, updated_at, state, symbol, strategy,
+            direction, score, win, payload
+        ) VALUES ('legacy-id', '2026-08-01T00:00:00+00:00',
+                  '2026-08-01T01:00:00+00:00', 'ACTIVE', 'UNI/USDT',
+                  'BREAKOUT_RETEST', 'LONG', 85, 0, '{}')
+        """
+    )
     connection.commit()
     connection.close()
 
     ledger = OutcomeLedger(str(path))
     migrated = sqlite3.connect(path)
     columns = {row[1] for row in migrated.execute("PRAGMA table_info(signal_outcomes)")}
+    tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    preserved = migrated.execute(
+        "SELECT signal_id, symbol, state FROM signal_outcomes WHERE signal_id = 'legacy-id'"
+    ).fetchone()
+    migrated_event = migrated.execute(
+        "SELECT event_type FROM signal_events WHERE signal_id = 'legacy-id'"
+    ).fetchone()
     migrated.close()
     ledger.close()
 
@@ -73,7 +102,20 @@ def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
         "mfe",
         "stopped_then_target_reached",
         "follow_up_until",
+        "setup_fingerprint",
+        "signal_type",
+        "parent_signal_id",
+        "setup_origin_at",
+        "major_structure_level",
+        "last_evaluated_at",
+        "terminal_state",
+        "terminal_at",
+        "result",
     } <= columns
+    assert "signal_events" in tables
+    assert preserved == ("legacy-id", "UNI/USDT", "ACTIVE")
+    assert migrated_event == ("MIGRATED_SNAPSHOT",)
+    assert len(list(tmp_path.glob("legacy.db.pre_identity_v3.*.bak"))) == 1
 
 
 @pytest.mark.asyncio
@@ -100,6 +142,22 @@ async def test_async_sqlite_adapter_persists_win_across_restart(tmp_path) -> Non
     assert stats.losses == 0
     assert stats.win_rate == 100
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_load_signal_uses_exact_immutable_id(tmp_path) -> None:
+    repository = SQLiteOutcomeRepository(str(tmp_path / "exact.db"))
+    first = replace(make_signal(), id="first")
+    second = replace(make_signal(), id="second")
+    assert await repository.record_signal(first)
+    assert await repository.record_signal(second)
+
+    loaded = await repository.load_signal("first")
+
+    assert loaded is not None
+    assert loaded.id == "first"
+    assert await repository.load_signal("missing") is None
+    await repository.close()
 
 
 @pytest.mark.asyncio

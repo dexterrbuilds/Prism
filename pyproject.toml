@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 prism-bot = "app.main:main"
+prism-reconcile-signal = "app.maintenance.reconcile_signal:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

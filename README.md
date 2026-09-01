@@ -6,7 +6,9 @@ Prism is a deterministic, asynchronous crypto-futures technical-analysis researc
 
 The runtime owns one persistent CCXT client. Each scan fetches at most 250 closed candles for `4h`, `1h`, and `15m`, plus `5m` only when SCALP mode is enabled, with bounded concurrency and retry/backoff. NumPy arrays flow through pure analysis functions into modular setup detectors. Candidates pass separate setup and entry-quality gates, structural stop, 2R, opposing-structure, volume, volatility, and higher-timeframe filters. A bounded lifecycle store deduplicates alerts.
 
-All valid candidates for a symbol are ranked before publication. Only one directional thesis can be sent per symbol per scan; overlapping detector labels are shown as supporting setups on that alert. Near-tied opposing directions are rejected as ambiguous. Deduplication is keyed by symbol and direction rather than strategy label.
+All valid candidates for a symbol are ranked before publication. Only one directional thesis can be sent per symbol per scan; overlapping detector labels are shown as supporting setups on that alert. Near-tied opposing directions are rejected as ambiguous. Setup-aware deduplication is separate from immutable signal-instance identity.
+
+Issued signals have immutable collision-resistant IDs and are tracked independently in memory and persistence. A separate deterministic setup fingerprint plus ATR-normalized geometry suppresses an unchanged opportunity without merging its lifecycle. The primary lifecycle store is keyed only by `signal_id`; symbol/direction are lookup attributes, so multiple legitimate same-symbol instances can coexist and resolve independently.
 
 Trade geometry is validated before publication. LONG plans must satisfy `stop < entry < TP1 <= TP2 < TP3` (when TP3 exists); SHORT plans use the exact inverse. TP1 may use opposing structure only when it lies between entry and the 2R target. Structure beyond 2R is treated as TP3, never mislabeled as TP1.
 
@@ -51,6 +53,10 @@ All secrets come from the environment. Load `.env` with your process manager or 
 | `PORT` | `10000` | Health server port |
 | `SCAN_INTERVAL_SECONDS` | `2700` | Delay after the complete watchlist (45 minutes) |
 | `LIFECYCLE_MONITOR_SECONDS` | `60` | Batch-ticker cadence for open setups between full scans |
+| `SIGNAL_DEDUP_WINDOW_MINUTES` | `360` | Supporting context for setup similarity—not a coin/direction cooldown; new structural origins are eligible immediately |
+| `SIGNAL_DEDUP_ENTRY_ATR` | `0.20` | Maximum ATR-normalized preferred-entry distance for similarity |
+| `SIGNAL_DEDUP_STOP_ATR` | `0.25` | Maximum ATR-normalized stop distance for similarity |
+| `SIGNAL_DEDUP_TARGET_ATR` | `0.25` | Maximum ATR-normalized target distance for similarity |
 | `REQUEST_CONCURRENCY` | `3` | Maximum simultaneous exchange requests |
 | `SEND_WATCH_ALERTS` | `false` | Enable 70–79 WATCH delivery |
 | `MINIMUM_VALID_SCORE` | `80` | VALID publication threshold |
@@ -100,6 +106,8 @@ DATABASE_URL=<Supabase Session Pooler connection string>
 Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
 
 Confirmed signals are persisted as live setups with an exact UTC expiry. Validity is derived per setup from its strategy-aware projected horizon and analysis timeframe, rounded to complete analysis candles; there is no global fixed validity duration. V2 separates directional bias, setup score, and entry quality. A strong thesis remains `WAITING_FOR_ENTRY` until a closed execution-timeframe retest and structure response pass the independent entry gate; a ticker touch alone cannot confirm a V2 entry. Terminal pre-entry states cannot activate after a restart. Only activated setups enter win-rate accounting. TP1 remains a win if the runner later reaches its stop.
+
+On startup and during lifecycle monitoring, Prism replays the bounded closed execution-candle window after each signal's persisted `last_evaluated_at` cursor. Candle highs/lows—not closes alone—drive entry, TP, and stop detection. If an active signal's stop and an unachieved target are both inside one candle and no finer path is available, the terminal outcome is `AMBIGUOUS` and is excluded from win rate. The append-only `signal_events` table makes lifecycle transitions auditable and idempotent. SQLite creates a timestamped file backup before the identity migration; Postgres creates `signal_outcomes_pre_identity_v3_backup` before adding columns.
 
 Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
 
@@ -165,6 +173,28 @@ docker run --rm -p 10000:10000 --env-file .env prism-signal-engine
 Create a Supabase project, open **Connect**, choose **Session pooler**, and copy its Postgres URI. The session pooler uses port `5432` and works with Railway's IPv4 network. Put the complete URI in Railway as the secret `DATABASE_URL`; percent-encode special characters in the database password if constructing the URI manually. Do not use the Supabase project URL, anon key, service-role key, or transaction REST API—Prism connects directly to Postgres.
 
 Prism creates an isolated `prism` schema plus `metadata` and `signal_outcomes` tables on first startup. Lifecycle updates use transactions and row locks, signal IDs are primary keys, and duplicate or stale transitions are rejected. TP1 remains the permanent WIN marker even if a runner later stops; TP2 remains a separate statistic. The pool is intentionally bounded at 1–3 connections and asyncpg's prepared-statement cache is disabled for Supavisor compatibility.
+
+### One-signal historical reconciliation
+
+Routine startup and scanner reconciliation remain capped at `CANDLE_LIMIT=250`. For a known legacy/orphaned signal whose relevant candles are older, use the isolated maintenance command. It requires one exact immutable signal ID, requests exchange history in pages of at most 250 candles, and never scans or rewrites other signal records.
+
+Preview first (read-only):
+
+```bash
+python -m app.maintenance.reconcile_signal \
+  SIG-UNI-L-20260831T214501000000-a7f2c91e00 --lookback-hours 168
+```
+
+Persist only proven, idempotent lifecycle transitions:
+
+```bash
+python -m app.maintenance.reconcile_signal \
+  SIG-UNI-L-20260831T214501000000-a7f2c91e00 --lookback-hours 168 --apply
+```
+
+The replay begins at that signal's creation or activation timestamp. If an execution candle contains both TP and SL, it recursively requests a complete finer-timeframe path (15M → 5M → 1M where available). Incomplete or still-indeterminate ordering is recorded as `AMBIGUOUS`, never assumed to be a win. Running the command again is safe because lifecycle transitions and event rows are idempotent.
+
+Signal deduplication is setup-based: fingerprint, confirmed structural origin, strategy family, entry zone, stop, targets, and ATR-normalized geometry are compared first. The 360-minute value only helps answer whether a candidate could still be the same opportunity. A new swing/BOS/CHoCH/sweep/retest origin is evaluated immediately, even inside that window; an unchanged setup can remain a duplicate after the window has elapsed.
 
 Use these production values:
 

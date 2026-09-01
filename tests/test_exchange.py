@@ -31,3 +31,37 @@ async def test_batch_price_snapshot_normalizes_futures_symbols(monkeypatch) -> N
     prices = await client.fetch_prices(("BTC/USDT", "ETH/USDT"))
     assert prices == {"BTC/USDT": 60_000.0, "ETH/USDT": 2_500.0}
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_historical_page_is_since_bounded_and_never_exceeds_250(monkeypatch) -> None:
+    client = ExchangeClient(Settings.from_env())
+    requested: dict[str, object] = {}
+
+    async def fake_fetch_ohlcv(
+        symbol: str,
+        *,
+        timeframe: str,
+        since: int,
+        limit: int,
+    ) -> list[list[float]]:
+        requested.update(symbol=symbol, timeframe=timeframe, since=since, limit=limit)
+        return [[since, 100, 101, 99, 100, 10]]
+
+    monkeypatch.setattr(client._client, "fetch_ohlcv", fake_fetch_ohlcv)
+    page = await client.fetch_ohlcv_page(
+        "UNI/USDT",
+        "15m",
+        1_700_000_000_000,
+        1_700_001_000_000,
+        limit=10_000,
+    )
+
+    assert requested == {
+        "symbol": "UNI/USDT:USDT",
+        "timeframe": "15m",
+        "since": 1_700_000_000_000,
+        "limit": 250,
+    }
+    assert len(page) == 1
+    await client.close()

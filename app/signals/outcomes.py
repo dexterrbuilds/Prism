@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,6 +30,8 @@ from app.signals.lifecycle import (
     STOP_STATES,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class PerformanceStats:
@@ -53,6 +56,7 @@ class PerformanceStats:
     average_mfe_atr: float | None = None
     winners_adverse_over_half_atr_pct: float | None = None
     stopped_then_target_reached: int = 0
+    ambiguous: int = 0
     by_mode: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
     breakdowns: dict[str, dict[str, dict[str, float | int | None]]] = field(default_factory=dict)
 
@@ -133,6 +137,15 @@ def serialize_signal(signal: Signal) -> str:
             if signal.directional_bias is not None
             else None
         ),
+        "setup_fingerprint": signal.setup_fingerprint,
+        "signal_type": signal.signal_type,
+        "parent_signal_id": signal.parent_signal_id,
+        "setup_origin_at": _iso(signal.setup_origin_at),
+        "major_structure_level": signal.major_structure_level,
+        "last_evaluated_at": _iso(signal.last_evaluated_at),
+        "terminal_state": signal.terminal_state,
+        "terminal_at": _iso(signal.terminal_at),
+        "result": signal.result,
     }
     return json.dumps(data, separators=(",", ":"), allow_nan=False)
 
@@ -216,6 +229,19 @@ def deserialize_signal(raw: str) -> Signal:
         stopped_then_target_reached=bool(data.get("stopped_then_target_reached", False)),
         follow_up_until=_datetime(data.get("follow_up_until")),
         directional_bias=directional_bias,
+        setup_fingerprint=str(data.get("setup_fingerprint", "")),
+        signal_type=str(data.get("signal_type", "INITIAL")),
+        parent_signal_id=str(data["parent_signal_id"]) if data.get("parent_signal_id") else None,
+        setup_origin_at=_datetime(data.get("setup_origin_at")),
+        major_structure_level=(
+            float(data["major_structure_level"])
+            if data.get("major_structure_level") is not None
+            else None
+        ),
+        last_evaluated_at=_datetime(data.get("last_evaluated_at")),
+        terminal_state=str(data["terminal_state"]) if data.get("terminal_state") else None,
+        terminal_at=_datetime(data.get("terminal_at")),
+        result=str(data["result"]) if data.get("result") else None,
     )
 
 
@@ -231,6 +257,37 @@ class OutcomeLedger:
         # worker threads, so the connection cannot be bound to its creator thread.
         self._connection = sqlite3.connect(self.path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
+        table_exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_outcomes'"
+        ).fetchone()
+        pre_migration_columns = (
+            {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(signal_outcomes)").fetchall()
+            }
+            if table_exists
+            else set()
+        )
+        identity_columns = {
+            "setup_fingerprint",
+            "signal_type",
+            "parent_signal_id",
+            "setup_origin_at",
+            "major_structure_level",
+            "last_evaluated_at",
+            "terminal_state",
+            "terminal_at",
+            "result",
+        }
+        if table_exists and not identity_columns.issubset(pre_migration_columns):
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = f"{self.path}.pre_identity_v3.{stamp}.bak"
+            backup = sqlite3.connect(backup_path)
+            try:
+                self._connection.backup(backup)
+            finally:
+                backup.close()
+            logger.info("outcome_database_backup_created backend=sqlite path=%s", backup_path)
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.execute("PRAGMA journal_size_limit=1048576")
@@ -268,11 +325,30 @@ class OutcomeLedger:
                 mfe REAL NOT NULL DEFAULT 0,
                 stopped_then_target_reached INTEGER NOT NULL DEFAULT 0,
                 follow_up_until TEXT,
+                setup_fingerprint TEXT,
+                signal_type TEXT NOT NULL DEFAULT 'INITIAL',
+                parent_signal_id TEXT,
+                setup_origin_at TEXT,
+                major_structure_level REAL,
+                last_evaluated_at TEXT,
+                terminal_state TEXT,
+                terminal_at TEXT,
+                result TEXT,
                 win INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS signal_events (
+                event_id TEXT PRIMARY KEY,
+                signal_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                price REAL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(signal_id, event_type)
+            );
             CREATE INDEX IF NOT EXISTS idx_signal_outcomes_created ON signal_outcomes(created_at);
             CREATE INDEX IF NOT EXISTS idx_signal_outcomes_state ON signal_outcomes(state);
+            CREATE INDEX IF NOT EXISTS idx_signal_events_signal ON signal_events(signal_id, event_at);
             """
         )
         existing_columns = {
@@ -292,6 +368,15 @@ class OutcomeLedger:
             "mfe": "REAL NOT NULL DEFAULT 0",
             "stopped_then_target_reached": "INTEGER NOT NULL DEFAULT 0",
             "follow_up_until": "TEXT",
+            "setup_fingerprint": "TEXT",
+            "signal_type": "TEXT NOT NULL DEFAULT 'INITIAL'",
+            "parent_signal_id": "TEXT",
+            "setup_origin_at": "TEXT",
+            "major_structure_level": "REAL",
+            "last_evaluated_at": "TEXT",
+            "terminal_state": "TEXT",
+            "terminal_at": "TEXT",
+            "result": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing_columns:
@@ -301,8 +386,28 @@ class OutcomeLedger:
         self._connection.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_mode ON signal_outcomes(mode)")
         self._connection.execute("CREATE INDEX IF NOT EXISTS idx_signal_outcomes_strategy ON signal_outcomes(strategy)")
         self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_setup ON signal_outcomes(setup_fingerprint)"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_state ON signal_outcomes(symbol, state)"
+        )
+        # Preserve an auditable snapshot for legacy rows without inventing a
+        # lifecycle path that was never recorded.
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO signal_events(event_id, signal_id, event_type, event_at, price, metadata)
+            SELECT signal_id || ':MIGRATED_SNAPSHOT', signal_id, 'MIGRATED_SNAPSHOT',
+                   updated_at, current_price, json_object('state', state)
+            FROM signal_outcomes
+            """
+        )
+        earliest = self._connection.execute(
+            "SELECT MIN(created_at) AS created_at FROM signal_outcomes"
+        ).fetchone()
+        tracking_start = str(earliest["created_at"]) if earliest and earliest["created_at"] else _iso(datetime.now(UTC))
+        self._connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('tracking_started_at', ?)",
-            (_iso(datetime.now(UTC)),),
+            (tracking_start,),
         )
         self._connection.commit()
 
@@ -322,8 +427,12 @@ class OutcomeLedger:
                 signal_id, created_at, updated_at, state, symbol, strategy,
                 direction, score, current_price, activated_at, expires_at,
                 entry_trigger_price, mode, entry_quality_score, atr_at_entry,
-                mae, mfe, stopped_then_target_reached, follow_up_until, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mae, mfe, stopped_then_target_reached, follow_up_until,
+                setup_fingerprint, signal_type, parent_signal_id, setup_origin_at,
+                major_structure_level, last_evaluated_at, terminal_state,
+                terminal_at, result, payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -345,11 +454,48 @@ class OutcomeLedger:
                 signal.mfe,
                 int(signal.stopped_then_target_reached),
                 _iso(signal.follow_up_until),
+                signal.setup_fingerprint,
+                signal.signal_type,
+                signal.parent_signal_id,
+                _iso(signal.setup_origin_at),
+                signal.major_structure_level,
+                _iso(signal.last_evaluated_at),
+                signal.terminal_state,
+                _iso(signal.terminal_at),
+                signal.result,
                 serialize_signal(signal),
             ),
         )
+        if cursor.rowcount == 1:
+            self._record_event_row(signal, "CREATED", signal.created_at)
         self._prune()
         self._connection.commit()
+        return cursor.rowcount == 1
+
+    def _record_event_row(self, signal: Signal, event_type: str, event_at: datetime) -> bool:
+        metadata = json.dumps(
+            {
+                "state": signal.state.value,
+                "reason": signal.lifecycle_reason,
+                "setup_fingerprint": signal.setup_fingerprint,
+            },
+            separators=(",", ":"),
+        )
+        cursor = self._connection.execute(
+            """
+            INSERT OR IGNORE INTO signal_events(
+                event_id, signal_id, event_type, event_at, price, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{signal.id}:{event_type}",
+                signal.id,
+                event_type,
+                _iso(event_at),
+                signal.current_price,
+                metadata,
+            ),
+        )
         return cursor.rowcount == 1
 
     def record_event(self, signal: Signal) -> bool:
@@ -391,6 +537,15 @@ class OutcomeLedger:
             "mfe = ?",
             "stopped_then_target_reached = ?",
             "follow_up_until = ?",
+            "setup_fingerprint = ?",
+            "signal_type = ?",
+            "parent_signal_id = ?",
+            "setup_origin_at = ?",
+            "major_structure_level = ?",
+            "last_evaluated_at = ?",
+            "terminal_state = ?",
+            "terminal_at = ?",
+            "result = ?",
         ]
         values: list[Any] = [
             _iso(event_at),
@@ -406,6 +561,15 @@ class OutcomeLedger:
             signal.mfe,
             int(signal.stopped_then_target_reached),
             _iso(signal.follow_up_until),
+            signal.setup_fingerprint,
+            signal.signal_type,
+            signal.parent_signal_id,
+            _iso(signal.setup_origin_at),
+            signal.major_structure_level,
+            _iso(signal.last_evaluated_at),
+            signal.terminal_state,
+            _iso(signal.terminal_at),
+            signal.result,
         ]
         for timestamp_field in timestamp_fields:
             assignments.append(f"{timestamp_field} = COALESCE({timestamp_field}, ?)")
@@ -417,6 +581,9 @@ class OutcomeLedger:
             f"UPDATE signal_outcomes SET {', '.join(assignments)} WHERE signal_id = ?",  # noqa: S608 - fixed column names
             values,
         )
+        if not self._record_event_row(signal, signal.state.value, event_at):
+            self._connection.rollback()
+            return False
         self._connection.commit()
         return inserted or existing is not None
 
@@ -425,7 +592,9 @@ class OutcomeLedger:
             """
             UPDATE signal_outcomes
             SET updated_at = ?, current_price = ?, mae = ?, mfe = ?,
-                stopped_then_target_reached = ?, follow_up_until = ?, payload = ?
+                stopped_then_target_reached = ?, follow_up_until = ?,
+                last_evaluated_at = ?, terminal_state = ?, terminal_at = ?,
+                result = ?, payload = ?
             WHERE signal_id = ?
             """,
             (
@@ -435,12 +604,30 @@ class OutcomeLedger:
                 signal.mfe,
                 int(signal.stopped_then_target_reached),
                 _iso(signal.follow_up_until),
+                _iso(signal.last_evaluated_at),
+                signal.terminal_state,
+                _iso(signal.terminal_at),
+                signal.result,
                 serialize_signal(signal),
                 signal.id,
             ),
         )
         self._connection.commit()
         return cursor.rowcount == 1
+
+    def load_signal(self, signal_id: str) -> Signal | None:
+        """Load one exact immutable signal instance, including terminal rows."""
+        row = self._connection.execute(
+            "SELECT payload FROM signal_outcomes WHERE signal_id = ?",
+            (signal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return deserialize_signal(str(row["payload"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("signal_payload_unreadable signal_id=%s", signal_id)
+            return None
 
     def load_open_signals(self) -> tuple[Signal, ...]:
         open_values = tuple(state.value for state in OPEN_STATES | STOP_STATES)
@@ -609,32 +796,16 @@ class OutcomeLedger:
                 else None
             ),
             stopped_then_target_reached=sum(int(row["stopped_then_target_reached"]) for row in rows),
+            ambiguous=sum(row["state"] == SignalState.AMBIGUOUS.value for row in rows),
             by_mode=by_mode,
             breakdowns=breakdowns,
         )
 
     def _prune(self) -> None:
-        row = self._connection.execute("SELECT COUNT(*) AS count FROM signal_outcomes").fetchone()
-        excess = max(0, int(row["count"]) - self._history_limit)
-        if not excess:
-            return
-        terminal = (
-            SignalState.TP2_HIT.value,
-            SignalState.STOPPED.value,
-            SignalState.SL_HIT.value,
-            SignalState.MISSED.value,
-            SignalState.INVALIDATED.value,
-            SignalState.EXPIRED.value,
-        )
-        self._connection.execute(
-            """
-            DELETE FROM signal_outcomes WHERE signal_id IN (
-                SELECT signal_id FROM signal_outcomes
-                WHERE state IN (?, ?, ?, ?, ?, ?) ORDER BY created_at ASC LIMIT ?
-            )
-            """,
-            (*terminal, excess),
-        )
+        # Historical outcomes are an audit ledger and must never be silently
+        # deleted.  ``history_limit`` now bounds in-memory restoration/use, not
+        # durable performance records.
+        return
 
     def close(self) -> None:
         self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")

@@ -53,16 +53,16 @@ def make_waiting_signal(*, direction: Direction = Direction.LONG) -> Signal:
     )
 
 
-def test_deduplication_requires_meaningful_change() -> None:
+def test_score_improvement_does_not_create_a_second_instance_of_same_setup() -> None:
     store = SignalStore()
-    assert store.should_publish(make_signal())
-    assert not store.should_publish(make_signal())
-    assert store.should_publish(make_signal(score=90))
+    first = replace(make_signal(), setup_fingerprint="same-setup")
+    assert store.should_publish(first)
+    assert not store.should_publish(replace(first, id="new-id", score=90))
 
 
 def test_deduplication_collapses_strategy_labels_for_same_direction() -> None:
     store = SignalStore()
-    first = make_signal()
+    first = replace(make_signal(), setup_fingerprint="same-setup")
     overlapping = replace(first, strategy="BOS_CONTINUATION", id="second")
     assert store.should_publish(first)
     assert not store.should_publish(overlapping)
@@ -323,7 +323,7 @@ def test_v2_entry_ready_requires_quality_retest_and_structure_then_triggers_once
     store = SignalStore()
     store.restore(signal)
     ready_at = signal.created_at + timedelta(minutes=1)
-    ready = store.mark_entry_ready("BTC/USDT", Direction.LONG, quality, observed_at=ready_at, current_price=100)
+    ready = store.mark_entry_ready(signal.id, quality, observed_at=ready_at, current_price=100)
     assert ready is not None and ready.state is SignalState.ENTRY_READY
     events = store.track_price("BTC/USDT", 100, observed_at=ready_at + timedelta(minutes=1))
     duplicate = store.track_price("BTC/USDT", 100, observed_at=ready_at + timedelta(minutes=2))
