@@ -8,7 +8,7 @@ from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 
-from app.models import Signal, SignalState
+from app.models import PublicationState, Signal, SignalState
 from app.signals.lifecycle import (
     ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
@@ -26,6 +26,7 @@ def serialize_event_metadata(signal: Signal) -> str:
             "state": signal.state.value,
             "reason": signal.lifecycle_reason,
             "setup_fingerprint": signal.setup_fingerprint,
+            "publication_state": signal.publication_state.value,
         },
         separators=(",", ":"),
     )
@@ -138,6 +139,15 @@ class PostgresOutcomeRepository:
                     terminal_state TEXT,
                     terminal_at TIMESTAMPTZ,
                     result TEXT,
+                    publication_state TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN',
+                    published_at TIMESTAMPTZ,
+                    channel_published_at TIMESTAMPTZ,
+                    channel_message_id TEXT,
+                    dm_delivery_attempted_at TIMESTAMPTZ,
+                    dm_success_count INTEGER NOT NULL DEFAULT 0,
+                    dm_failure_count INTEGER NOT NULL DEFAULT 0,
+                    publish_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_publish_error TEXT,
                     win BOOLEAN NOT NULL DEFAULT FALSE,
                     payload JSONB NOT NULL
                 );
@@ -176,6 +186,27 @@ class PostgresOutcomeRepository:
             )
             await connection.execute(
                 f"""
+                DO $migration$
+                BEGIN
+                    IF (
+                        SELECT COUNT(*) FROM information_schema.columns
+                        WHERE table_schema = '{self._schema}'
+                          AND table_name = 'signal_outcomes'
+                          AND column_name IN (
+                              'publication_state', 'published_at', 'channel_published_at',
+                              'channel_message_id', 'dm_delivery_attempted_at',
+                              'dm_success_count', 'dm_failure_count', 'publish_attempts',
+                              'last_publish_error'
+                          )
+                    ) < 9 THEN
+                        EXECUTE 'CREATE TABLE IF NOT EXISTS "{self._schema}".signal_outcomes_pre_publication_v4_backup AS TABLE {self._outcomes}';
+                    END IF;
+                END
+                $migration$;
+                """
+            )
+            await connection.execute(
+                f"""
                 ALTER TABLE {self._outcomes}
                     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
                     ADD COLUMN IF NOT EXISTS entry_trigger_price DOUBLE PRECISION,
@@ -197,13 +228,23 @@ class PostgresOutcomeRepository:
                     ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ,
                     ADD COLUMN IF NOT EXISTS terminal_state TEXT,
                     ADD COLUMN IF NOT EXISTS terminal_at TIMESTAMPTZ,
-                    ADD COLUMN IF NOT EXISTS result TEXT
+                    ADD COLUMN IF NOT EXISTS result TEXT,
+                    ADD COLUMN IF NOT EXISTS publication_state TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN',
+                    ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS channel_published_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS channel_message_id TEXT,
+                    ADD COLUMN IF NOT EXISTS dm_delivery_attempted_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS dm_success_count INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS dm_failure_count INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS publish_attempts INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS last_publish_error TEXT
                 """
             )
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_mode ON {self._outcomes}(mode)")
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_strategy ON {self._outcomes}(strategy)")
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_setup ON {self._outcomes}(setup_fingerprint)")
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_symbol_state ON {self._outcomes}(symbol, state)")
+            await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_outcomes_publication ON {self._outcomes}(publication_state, state)")
             await connection.execute(f"CREATE INDEX IF NOT EXISTS idx_prism_events_signal ON {self._events}(signal_id, event_at)")
             await connection.execute(
                 f"""
@@ -240,10 +281,14 @@ class PostgresOutcomeRepository:
                 mae, mfe, stopped_then_target_reached, follow_up_until,
                 setup_fingerprint, signal_type, parent_signal_id, setup_origin_at,
                 major_structure_level, last_evaluated_at, terminal_state,
-                terminal_at, result, payload
+                terminal_at, result, publication_state, published_at,
+                channel_published_at, channel_message_id, dm_delivery_attempted_at,
+                dm_success_count, dm_failure_count, publish_attempts,
+                last_publish_error, payload
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                       $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                      $23, $24, $25, $26, $27, $28, $29::jsonb)
+                      $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+                      $33, $34, $35, $36, $37, $38::jsonb)
             ON CONFLICT (signal_id) DO NOTHING
             """,
             signal.id,
@@ -274,6 +319,15 @@ class PostgresOutcomeRepository:
             signal.terminal_state,
             signal.terminal_at,
             signal.result,
+            signal.publication_state.value,
+            signal.published_at,
+            signal.channel_published_at,
+            signal.channel_message_id,
+            signal.dm_delivery_attempted_at,
+            signal.dm_success_count,
+            signal.dm_failure_count,
+            signal.publish_attempts,
+            signal.last_publish_error,
             serialize_signal(signal),
         )
         inserted = result == "INSERT 0 1"
@@ -360,6 +414,15 @@ class PostgresOutcomeRepository:
                 "terminal_state = $21",
                 "terminal_at = $22",
                 "result = $23",
+                "publication_state = $24",
+                "published_at = $25",
+                "channel_published_at = $26",
+                "channel_message_id = $27",
+                "dm_delivery_attempted_at = $28",
+                "dm_success_count = $29",
+                "dm_failure_count = $30",
+                "publish_attempts = $31",
+                "last_publish_error = $32",
             ]
             values: list[Any] = [
                 signal.id,
@@ -385,6 +448,15 @@ class PostgresOutcomeRepository:
                 signal.terminal_state,
                 signal.terminal_at,
                 signal.result,
+                signal.publication_state.value,
+                signal.published_at,
+                signal.channel_published_at,
+                signal.channel_message_id,
+                signal.dm_delivery_attempted_at,
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
             ]
             for field in timestamp_fields.get(signal.state, ()):
                 values.append(event_at)
@@ -407,7 +479,12 @@ class PostgresOutcomeRepository:
                 SET updated_at = $2, current_price = $3, mae = $4, mfe = $5,
                     stopped_then_target_reached = $6, follow_up_until = $7,
                     last_evaluated_at = $8, terminal_state = $9,
-                    terminal_at = $10, result = $11, payload = $12::jsonb
+                    terminal_at = $10, result = $11, publication_state = $12,
+                    published_at = $13, channel_published_at = $14,
+                    channel_message_id = $15, dm_delivery_attempted_at = $16,
+                    dm_success_count = $17, dm_failure_count = $18,
+                    publish_attempts = $19, last_publish_error = $20,
+                    payload = $21::jsonb
                 WHERE signal_id = $1
                 """,
                 signal.id,
@@ -421,9 +498,57 @@ class PostgresOutcomeRepository:
                 signal.terminal_state,
                 signal.terminal_at,
                 signal.result,
+                signal.publication_state.value,
+                signal.published_at,
+                signal.channel_published_at,
+                signal.channel_message_id,
+                signal.dm_delivery_attempted_at,
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
                 serialize_signal(signal),
             )
         return result == "UPDATE 1"
+
+    async def record_publication(self, signal: Signal) -> bool:
+        """Persist Telegram publication metadata without changing lifecycle state."""
+        event_at = signal.published_at or signal.dm_delivery_attempted_at or datetime.now(UTC)
+        event_type = (
+            "INITIAL_PUBLISHED"
+            if signal.publication_state is PublicationState.PUBLISHED
+            else "UNPUBLISHED_TERMINAL"
+            if signal.publication_state is PublicationState.UNPUBLISHED_TERMINAL
+            else "PUBLISH_FAILED"
+        )
+        async with self._pool.acquire() as connection, connection.transaction():
+            result: str = await connection.execute(
+                f"""
+                UPDATE {self._outcomes}
+                SET updated_at = $2, publication_state = $3, published_at = $4,
+                    channel_published_at = $5, channel_message_id = $6,
+                    dm_delivery_attempted_at = $7, dm_success_count = $8,
+                    dm_failure_count = $9, publish_attempts = $10,
+                    last_publish_error = $11, payload = $12::jsonb
+                WHERE signal_id = $1
+                """,
+                signal.id,
+                datetime.now(UTC),
+                signal.publication_state.value,
+                signal.published_at,
+                signal.channel_published_at,
+                signal.channel_message_id,
+                signal.dm_delivery_attempted_at,
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
+                serialize_signal(signal),
+            )
+            if result != "UPDATE 1":
+                return False
+            await self._insert_event(connection, signal, event_type, event_at)
+            return True
 
     async def load_signal(self, signal_id: str) -> Signal | None:
         """Load one exact immutable signal instance, including terminal rows."""

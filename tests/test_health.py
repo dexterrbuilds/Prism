@@ -30,6 +30,10 @@ async def test_health_endpoint_reports_runtime_state() -> None:
             "reentries_issued": 0,
             "same_symbol_concurrent_signals": 0,
             "orphaned_signals_reconciled": 0,
+            "publication_successes": 0,
+            "publication_failures": 0,
+            "dm_delivery_failures": 0,
+            "lifecycle_notifications_suppressed": 0,
         }
 
 

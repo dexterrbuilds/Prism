@@ -70,6 +70,7 @@ async def run() -> None:
         else:
             try:
                 await scanner.reconcile_open_signals(startup=True)
+                await scanner.recover_unpublished_signals()
             except Exception as exc:
                 # Reconciliation is recoverable and will retry during the
                 # lifecycle monitor; startup must remain available.

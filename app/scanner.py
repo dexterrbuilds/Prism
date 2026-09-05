@@ -19,6 +19,7 @@ from app.models import (
     ConfluenceEvidence,
     Direction,
     MarketSnapshot,
+    PublicationState,
     RejectionReason,
     SetupCandidate,
     Signal,
@@ -28,6 +29,7 @@ from app.models import (
 from app.signals.entry_plan import calculate_entry_plan
 from app.signals.entry_quality import score_entry_quality, two_gate_result
 from app.signals.lifecycle import (
+    TERMINAL_STATES,
     SignalStore,
     build_setup_fingerprint,
     create_signal_id,
@@ -40,7 +42,7 @@ from app.signals.validator import validate_candidate
 from app.signals.validity import derive_setup_validity_minutes
 from app.strategies import detect_setups
 from app.strategies.counter import evaluate_counter_setup
-from app.telegram.bot import TelegramService
+from app.telegram.bot import TelegramPublishResult, TelegramService
 from app.telegram.chart import render_signal_chart
 from app.telegram.pnl_card import render_pnl_card
 
@@ -137,6 +139,143 @@ class Scanner:
         self.ai_reviews = ai_reviews
         self.store = SignalStore(max_size=128)
         self._manual_scan_event = asyncio.Event()
+
+    def _initial_publication_succeeded(self, delivered: set[str]) -> bool:
+        if self.settings.dry_run:
+            return True
+        channel_success = bool(delivered.intersection(self.settings.telegram_channel_ids))
+        primary = self.settings.telegram_chat_ids[0] if self.settings.telegram_chat_ids else None
+        return channel_success or (primary is not None and primary in delivered)
+
+    async def _ensure_initial_publication(
+        self,
+        signal: Signal,
+        *,
+        chart_png: bytes | None = None,
+    ) -> Signal:
+        """Publish/retry one immutable signal and persist delivery separately from lifecycle."""
+        intended = signal.intended_destination_ids or self.settings.telegram_delivery_ids
+        delivered_before = set(signal.delivered_destination_ids)
+        pending = tuple(destination for destination in intended if destination not in delivered_before)
+        if signal.publication_state is PublicationState.PUBLISHED and not pending:
+            return signal
+        logger.info(
+            "publication_path signal_id=%s stage=TELEGRAM_PUBLISH_START state=%s pending_destinations=%d attempt=%d",
+            signal.id,
+            signal.publication_state.value,
+            len(pending),
+            signal.publish_attempts + 1,
+        )
+        raw_result = await self.telegram.publish(signal, chart_png=chart_png, destinations=pending)
+        if isinstance(raw_result, TelegramPublishResult):
+            delivered_now = set(raw_result.delivered_destination_ids)
+            errors = raw_result.errors
+            message_id_for = raw_result.message_id_for
+        else:
+            # Test doubles and older adapters may still return bool.
+            delivered_now = set(pending) if raw_result else set()
+            errors = () if raw_result else ("Telegram adapter returned failure",)
+            message_id_for = lambda destination: None  # noqa: E731
+        delivered = delivered_before | delivered_now
+        now = datetime.now(UTC)
+        channel_successes = delivered.intersection(self.settings.telegram_channel_ids)
+        dm_successes = delivered.intersection(self.settings.telegram_chat_ids)
+        attempted_dms = set(pending).intersection(self.settings.telegram_chat_ids)
+        channel_message_id = signal.channel_message_id
+        if channel_message_id is None:
+            for destination in self.settings.telegram_channel_ids:
+                if destination in delivered_now:
+                    channel_message_id = message_id_for(destination)
+                    break
+        initial_success = self._initial_publication_succeeded(delivered)
+        state = PublicationState.PUBLISHED if initial_success else PublicationState.PUBLISH_FAILED
+        failed_dms = set(intended).intersection(self.settings.telegram_chat_ids) - dm_successes
+        updated = replace(
+            signal,
+            publication_state=state,
+            published_at=signal.published_at or (now if initial_success else None),
+            channel_published_at=(
+                signal.channel_published_at or (now if channel_successes else None)
+            ),
+            channel_message_id=channel_message_id,
+            dm_delivery_attempted_at=(now if attempted_dms else signal.dm_delivery_attempted_at),
+            dm_success_count=len(dm_successes),
+            dm_failure_count=len(failed_dms),
+            publish_attempts=signal.publish_attempts + 1,
+            last_publish_error="; ".join(errors)[:500] if errors else None,
+            intended_destination_ids=intended,
+            delivered_destination_ids=tuple(destination for destination in intended if destination in delivered),
+        )
+        self.store.restore(updated)
+        publication_persisted = True
+        if (
+            self.outcomes is not None
+            and (not self.settings.dry_run or self.settings.dry_run_track_outcomes)
+            and not await self.outcomes.record_publication(updated)
+        ):
+            publication_persisted = False
+            logger.error(
+                "publication_path signal_id=%s stage=PUBLISH_RESULT_PERSIST_FAILED state=%s",
+                signal.id,
+                state.value,
+            )
+        if publication_persisted:
+            logger.info(
+                "publication_path signal_id=%s stage=PUBLISH_RESULT_PERSISTED state=%s",
+                signal.id,
+                state.value,
+            )
+        logger.info(
+            "publication_path signal_id=%s stage=CHANNEL_SEND_RESULT success=%s message_id=%s",
+            signal.id,
+            bool(channel_successes),
+            channel_message_id or "none",
+        )
+        logger.info(
+            "publication_path signal_id=%s stage=DM_FANOUT_RESULT sent=%d failed=%d",
+            signal.id,
+            len(dm_successes),
+            len(failed_dms),
+        )
+        if initial_success:
+            if signal.published_at is None:
+                self.health.publication_successes += 1
+            logger.info(
+                "publication_path signal_id=%s stage=SIGNAL_PUBLISHED delivered=%d",
+                signal.id,
+                len(delivered),
+            )
+        else:
+            self.health.publication_failures += 1
+            logger.warning(
+                "publication_path signal_id=%s stage=PUBLISH_FAILED errors=%s",
+                signal.id,
+                updated.last_publish_error or "no primary/channel destination accepted the message",
+            )
+        self.health.dm_delivery_failures += len(failed_dms)
+        return updated
+
+    async def recover_unpublished_signals(self) -> int:
+        """Retry still-actionable initial publications and incomplete DM fan-out."""
+        recovered = 0
+        now = datetime.now(UTC)
+        for expired in self.store.expire_due(now):
+            await self._publish_lifecycle_events([expired], expired.symbol)
+        for signal in self.store.open_signals():
+            if signal.publication_state not in {
+                PublicationState.PUBLISH_PENDING,
+                PublicationState.PUBLISH_FAILED,
+                PublicationState.PUBLISHED,
+            }:
+                continue
+            if signal.expires_at is not None and now >= signal.expires_at and signal.activated_at is None:
+                continue
+            before = signal.publication_state
+            updated = await self._ensure_initial_publication(signal)
+            if before is not PublicationState.PUBLISHED and updated.publication_state is PublicationState.PUBLISHED:
+                recovered += 1
+                logger.info("publication_path signal_id=%s stage=STARTUP_PUBLICATION_RECOVERED", signal.id)
+        return recovered
 
     async def restore_outcomes(self) -> None:
         """Restore persisted open theses before the first market scan."""
@@ -249,6 +388,7 @@ class Scanner:
             return
         await self._refresh_entry_readiness(observed_at)
         await self.reconcile_open_signals()
+        await self.recover_unpublished_signals()
         try:
             prices = await self.exchange.fetch_prices(symbols)
         except Exception as exc:
@@ -363,6 +503,39 @@ class Scanner:
                     event.state.value,
                 )
                 continue
+            # ENTRY_READY is the first publishable state when WATCH alerts are
+            # disabled.  Send the full original signal—not a contextless
+            # lifecycle update—and persist success before enabling follow-ups.
+            if (
+                event.state is SignalState.ENTRY_READY
+                and event.publication_state
+                in {PublicationState.PUBLISH_PENDING, PublicationState.PUBLISH_FAILED}
+            ):
+                await self._ensure_initial_publication(event)
+                continue
+            if event.publication_state is not PublicationState.PUBLISHED or event.published_at is None:
+                self.health.lifecycle_notifications_suppressed += 1
+                logger.warning(
+                    "lifecycle_notification_suppressed signal_id=%s state=%s publication_state=%s reason=initial_not_published",
+                    event.id,
+                    event.state.value,
+                    event.publication_state.value,
+                )
+                if event.state in TERMINAL_STATES:
+                    unpublished = replace(
+                        event,
+                        publication_state=PublicationState.UNPUBLISHED_TERMINAL,
+                        last_publish_error=(
+                            event.last_publish_error
+                            or "Signal became terminal before its initial Telegram publication succeeded."
+                        ),
+                    )
+                    self.store.restore(unpublished)
+                    if self.outcomes is not None and (
+                        not self.settings.dry_run or self.settings.dry_run_track_outcomes
+                    ):
+                        await self.outcomes.record_publication(unpublished)
+                continue
             lifecycle_card: bytes | None = None
             should_render_pnl = event.state in {SignalState.TP1_HIT, SignalState.TP2_HIT} or (
                 event.state in {SignalState.STOPPED, SignalState.SL_HIT} and event.tp1_hit_at is None
@@ -372,7 +545,18 @@ class Scanner:
                     lifecycle_card = await asyncio.to_thread(render_pnl_card, event)
                 except Exception as exc:
                     logger.warning("pnl_card_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
-            await self.telegram.publish(event, lifecycle=True, chart_png=lifecycle_card)
+            result = await self.telegram.publish(
+                event,
+                lifecycle=True,
+                chart_png=lifecycle_card,
+                destinations=event.delivered_destination_ids,
+            )
+            if not result and not self.settings.dry_run:
+                logger.warning(
+                    "lifecycle_delivery_failure signal_id=%s state=%s",
+                    event.id,
+                    event.state.value,
+                )
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.health.scanner = "running"
@@ -452,11 +636,33 @@ class Scanner:
             logger.info("setup_rejected symbol=%s reason=%s", symbol, RejectionReason.NO_SETUP.value)
         valid_signals: list[Signal] = []
         for candidate in candidates:
+            created_at = datetime.fromtimestamp(as_of_ms / 1000, UTC)
+            candidate_signal_id = create_signal_id(symbol, candidate.direction, created_at)
+            logger.info(
+                "publication_path signal_id=%s stage=CANDIDATE_DETECTED symbol=%s strategy=%s direction=%s",
+                candidate_signal_id,
+                symbol,
+                candidate.strategy,
+                candidate.direction.value,
+            )
             score = score_candidate(candidate, context)
             setup_minimum = self.settings.scalp_minimum_setup_score if candidate.mode is SignalMode.SCALP else self.settings.minimum_valid_score
             if score.total < setup_minimum:
-                logger.info("setup_rejected symbol=%s strategy=%s score=%d reason=%s", symbol, candidate.strategy, score.total, RejectionReason.LOW_CONFLUENCE.value)
+                logger.info(
+                    "publication_path signal_id=%s stage=SETUP_REJECTED symbol=%s strategy=%s score=%d reason=%s",
+                    candidate_signal_id,
+                    symbol,
+                    candidate.strategy,
+                    score.total,
+                    RejectionReason.LOW_CONFLUENCE.value,
+                )
                 continue
+            logger.info(
+                "publication_path signal_id=%s stage=SETUP_SCORE_PASSED score=%d minimum=%d",
+                candidate_signal_id,
+                score.total,
+                setup_minimum,
+            )
             primary_tf = "15m" if candidate.mode is SignalMode.SCALP else "1h"
             execution_tf = "5m" if candidate.mode is SignalMode.SCALP else "15m"
             entry_plan = calculate_entry_plan(candidate, context)
@@ -469,7 +675,13 @@ class Scanner:
                     entry_plan,
                 )
             except RiskPlanningError:
-                logger.info("setup_rejected symbol=%s strategy=%s reason=%s", symbol, candidate.strategy, RejectionReason.POOR_RR.value)
+                logger.info(
+                    "publication_path signal_id=%s stage=HARD_VALIDATION_REJECTED symbol=%s strategy=%s reason=%s",
+                    candidate_signal_id,
+                    symbol,
+                    candidate.strategy,
+                    RejectionReason.POOR_RR.value,
+                )
                 continue
             entry_quality = score_entry_quality(
                 candidate,
@@ -490,15 +702,36 @@ class Scanner:
                 entry_minimum,
             )
             if not validation.valid:
-                logger.info("setup_rejected symbol=%s strategy=%s score=%d reason=%s", symbol, candidate.strategy, score.total, validation.reason.value if validation.reason else "UNKNOWN")
+                logger.info(
+                    "publication_path signal_id=%s stage=HARD_VALIDATION_REJECTED symbol=%s strategy=%s score=%d entry_score=%d reason=%s",
+                    candidate_signal_id,
+                    symbol,
+                    candidate.strategy,
+                    score.total,
+                    entry_quality.total,
+                    validation.reason.value if validation.reason else "UNKNOWN",
+                )
                 continue
             gate = two_gate_result(score.total, entry_quality, setup_minimum, entry_minimum)
             if gate.hard_reject:
-                logger.info("setup_rejected symbol=%s strategy=%s reason=%s", symbol, candidate.strategy, entry_quality.hard_reasons[0])
+                logger.info(
+                    "publication_path signal_id=%s stage=ENTRY_QUALITY_REJECTED symbol=%s strategy=%s entry_score=%d reason=%s",
+                    candidate_signal_id,
+                    symbol,
+                    candidate.strategy,
+                    entry_quality.total,
+                    entry_quality.hard_reasons[0],
+                )
                 continue
+            logger.info(
+                "publication_path signal_id=%s stage=HARD_VALIDATION_PASSED setup_score=%d entry_score=%d actionable=%s",
+                candidate_signal_id,
+                score.total,
+                entry_quality.total,
+                gate.actionable,
+            )
             ready = gate.actionable and entry_quality.retest_completed and entry_quality.lower_timeframe_confirmed
             state = SignalState.ENTRY_READY if ready else SignalState.WAITING_FOR_ENTRY
-            created_at = datetime.fromtimestamp(as_of_ms / 1000, UTC)
             validity_minutes = derive_setup_validity_minutes(candidate, plan)
             expires_at = created_at + timedelta(minutes=validity_minutes)
             atr = float(context.timeframes[primary_tf].indicators.atr[-1])
@@ -536,7 +769,7 @@ class Scanner:
                 f"Entry triggers before {expires_at.strftime('%H:%M UTC')}",
             )
             signal = Signal(
-                id=create_signal_id(symbol, candidate.direction, created_at), symbol=symbol, strategy=candidate.strategy,
+                id=candidate_signal_id, symbol=symbol, strategy=candidate.strategy,
                 direction=candidate.direction, regime=context.regime, score=score.total, grade=score.grade,
                 state=state,
                 trade=plan,
@@ -559,15 +792,49 @@ class Scanner:
                 major_structure_level=major_structure_level,
                 last_evaluated_at=created_at,
             )
+            logger.info(
+                "publication_path signal_id=%s stage=SIGNAL_CREATED symbol=%s strategy=%s state=%s",
+                signal.id,
+                symbol,
+                candidate.strategy,
+                signal.state.value,
+            )
             if self.ai_reviews is not None and self.ai_reviews.enabled:
                 review = await self.ai_reviews.review(signal)
                 signal = replace(signal, ai_review=review)
                 if review.verdict is AIReviewVerdict.REJECT:
-                    logger.info("setup_rejected symbol=%s strategy=%s reason=AI_REJECT", symbol, candidate.strategy)
+                    logger.info(
+                        "publication_path signal_id=%s stage=AI_REVIEW_REJECTED symbol=%s strategy=%s",
+                        signal.id,
+                        symbol,
+                        candidate.strategy,
+                    )
                     continue
                 if review.verdict is AIReviewVerdict.WAIT:
                     signal = replace(signal, state=SignalState.WAITING_FOR_ENTRY)
-            logger.info("signal_confirmed symbol=%s strategy=%s score=%d state=%s", symbol, candidate.strategy, score.total, state.value)
+                logger.info(
+                    "publication_path signal_id=%s stage=AI_REVIEW_PASSED verdict=%s",
+                    signal.id,
+                    review.verdict.value,
+                )
+            should_alert = signal.state is SignalState.ENTRY_READY or self.settings.send_watch_alerts
+            signal = replace(
+                signal,
+                publication_state=(
+                    PublicationState.PUBLISH_PENDING if should_alert else PublicationState.INTERNAL_ONLY
+                ),
+                intended_destination_ids=self.settings.telegram_delivery_ids,
+            )
+            logger.info(
+                "publication_path signal_id=%s stage=SETUP_APPROVED symbol=%s strategy=%s setup_score=%d entry_score=%d state=%s publishable=%s",
+                signal.id,
+                symbol,
+                candidate.strategy,
+                score.total,
+                entry_quality.total,
+                signal.state.value,
+                should_alert,
+            )
             valid_signals.append(signal)
         selected = select_best_signal(valid_signals)
         if valid_signals and selected is None:
@@ -593,7 +860,7 @@ class Scanner:
             if duplicate is not None:
                 self.health.duplicate_candidates_suppressed += 1
                 logger.info(
-                    "duplicate_candidate_suppressed candidate_id=%s existing_signal_id=%s "
+                    "publication_path signal_id=%s stage=DEDUP_RESULT publish=false matched_signal_id=%s "
                     "symbol=%s setup_fingerprint=%s reason=%s",
                     selected.id,
                     duplicate.signal.id,
@@ -601,7 +868,35 @@ class Scanner:
                     selected.setup_fingerprint,
                     duplicate.reason,
                 )
+                existing = duplicate.signal
+                if (
+                    existing.publication_state is PublicationState.INTERNAL_ONLY
+                    and selected.state is SignalState.ENTRY_READY
+                    and selected.entry_quality is not None
+                ):
+                    existing_ready = self.store.mark_entry_ready(
+                        existing.id,
+                        selected.entry_quality,
+                        observed_at=selected.created_at,
+                        current_price=selected.current_price or selected.trade.preferred_entry,
+                        minimum_score=(
+                            self.settings.scalp_minimum_entry_score
+                            if selected.mode is SignalMode.SCALP
+                            else self.settings.minimum_entry_score
+                        ),
+                    )
+                    if existing_ready is not None:
+                        await self._publish_lifecycle_events([existing_ready], symbol)
+                elif existing.publication_state in {
+                    PublicationState.PUBLISH_PENDING,
+                    PublicationState.PUBLISH_FAILED,
+                }:
+                    await self._ensure_initial_publication(existing)
             else:
+                logger.info(
+                    "publication_path signal_id=%s stage=DEDUP_RESULT publish=true matched_signal_id=none",
+                    selected.id,
+                )
                 parent = self.store.find_reentry_parent(selected)
                 if parent is not None:
                     selected = replace(
@@ -619,6 +914,11 @@ class Scanner:
                         self.store.discard(selected.id)
                         logger.info("signal_id_collision_suppressed symbol=%s signal_id=%s", symbol, selected.id)
                         return SymbolScanResult(True)
+                    logger.info(
+                        "publication_path signal_id=%s stage=SIGNAL_PERSISTED backend=%s",
+                        selected.id,
+                        self.outcomes.backend,
+                    )
                 self.health.signals_issued += 1
                 logger.info(
                     "signal_instance_issued signal_id=%s setup_fingerprint=%s type=%s parent_signal_id=%s",
@@ -628,21 +928,30 @@ class Scanner:
                     selected.parent_signal_id or "none",
                 )
                 chart_png: bytes | None = None
-                try:
-                    chart_png = render_signal_chart(
-                        selected,
-                        series["1h"],
-                        context.timeframes["1h"].indicators,
-                        context.timeframes["1h"].zones,
-                    )
-                except Exception as exc:
-                    logger.warning("chart_render_failure symbol=%s error=%s", symbol, type(exc).__name__)
-                should_alert = selected.state is SignalState.ENTRY_READY or self.settings.send_watch_alerts
-                if should_alert:
-                    await self.telegram.publish(selected, chart_png=chart_png)
+                if selected.publication_state is PublicationState.PUBLISH_PENDING:
+                    try:
+                        chart_png = render_signal_chart(
+                            selected,
+                            series["1h"],
+                            context.timeframes["1h"].indicators,
+                            context.timeframes["1h"].zones,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "chart_render_failure signal_id=%s symbol=%s error=%s message=%s",
+                            selected.id,
+                            symbol,
+                            type(exc).__name__,
+                            str(exc)[:300],
+                        )
+                    await self._ensure_initial_publication(selected, chart_png=chart_png)
                 else:
-                    logger.info("watch_suppressed symbol=%s strategy=%s entry_quality=%d", symbol, selected.strategy, selected.entry_quality.total if selected.entry_quality else 0)
-                monitored = selected
+                    logger.info(
+                        "publication_path signal_id=%s stage=INITIAL_PUBLICATION_DEFERRED reason=watch_alerts_disabled entry_quality=%d",
+                        selected.id,
+                        selected.entry_quality.total if selected.entry_quality else 0,
+                    )
+                monitored = self.store.get(selected.id) or selected
                 if selected.state is SignalState.CREATED:
                     monitored = transition(
                         selected,

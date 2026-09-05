@@ -18,7 +18,7 @@ CCXT -> closed-candle validation -> indicators / regime / structure / zones
      -> setup registry -> category-capped setup score -> structure-derived entry plan
      -> entry-quality score -> strict risk validator -> optional AI quality review
      -> bounded lifecycle + dedupe -> Supabase Postgres / SQLite outcomes
-     -> Telegram (or DRY_RUN log)
+     -> persisted publication state -> Telegram channel + DM fan-out (or DRY_RUN log)
 ```
 
 `FastAPI`, the scanner, and `python-telegram-bot` run concurrently on one asyncio loop. SIGTERM/SIGINT stops Uvicorn and polling, then closes CCXT.
@@ -103,11 +103,13 @@ OUTCOME_BACKEND=postgres
 DATABASE_URL=<Supabase Session Pooler connection string>
 ```
 
-Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent.
+Only deduplicated WATCH alerts (when explicitly enabled), VALID/EXCEPTIONAL signals, and lifecycle events are delivered. A no-trade scan remains silent. Initial Telegram publication has a separate persisted state (`PUBLISH_PENDING`, `PUBLISH_FAILED`, or `PUBLISHED`) and is not inferred from the trading lifecycle state. A signal may start sending user-facing lifecycle updates only after its original alert has been accepted by that destination.
+
+Channel delivery and DM fan-out are recorded independently. Channel success or delivery to the configured primary DM marks the signal as issued; failed secondary destinations remain pending and are retried with the same immutable `signal_id`, without resending to destinations that already accepted the alert. Startup recovery retries still-actionable unpublished signals. If one becomes invalid or expires before it was ever published, Prism records `UNPUBLISHED_TERMINAL` for audit and sends no contextless lifecycle message.
 
 Confirmed signals are persisted as live setups with an exact UTC expiry. Validity is derived per setup from its strategy-aware projected horizon and analysis timeframe, rounded to complete analysis candles; there is no global fixed validity duration. V2 separates directional bias, setup score, and entry quality. A strong thesis remains `WAITING_FOR_ENTRY` until a closed execution-timeframe retest and structure response pass the independent entry gate; a ticker touch alone cannot confirm a V2 entry. Terminal pre-entry states cannot activate after a restart. Only activated setups enter win-rate accounting. TP1 remains a win if the runner later reaches its stop.
 
-On startup and during lifecycle monitoring, Prism replays the bounded closed execution-candle window after each signal's persisted `last_evaluated_at` cursor. Candle highs/lows—not closes alone—drive entry, TP, and stop detection. If an active signal's stop and an unachieved target are both inside one candle and no finer path is available, the terminal outcome is `AMBIGUOUS` and is excluded from win rate. The append-only `signal_events` table makes lifecycle transitions auditable and idempotent. SQLite creates a timestamped file backup before the identity migration; Postgres creates `signal_outcomes_pre_identity_v3_backup` before adding columns.
+On startup and during lifecycle monitoring, Prism replays the bounded closed execution-candle window after each signal's persisted `last_evaluated_at` cursor. Candle highs/lows—not closes alone—drive entry, TP, and stop detection. If an active signal's stop and an unachieved target are both inside one candle and no finer path is available, the terminal outcome is `AMBIGUOUS` and is excluded from win rate. The append-only `signal_events` table makes lifecycle transitions auditable and idempotent. SQLite creates timestamped file backups before identity/publication migrations; Postgres creates `signal_outcomes_pre_identity_v3_backup` and `signal_outcomes_pre_publication_v4_backup` before their additive migrations.
 
 Initial signal alerts include the latest closed 15M price, the exact entry trigger, and a bounded 1100×700 PNG chart with the last 80 closed 1H candles, EMA20/EMA50, scored S/R zones, volume, UTC time markers, entry zone, stop, and ordered targets. Charts are rendered only for the selected alert and released after delivery.
 
@@ -172,7 +174,7 @@ docker run --rm -p 10000:10000 --env-file .env prism-signal-engine
 
 Create a Supabase project, open **Connect**, choose **Session pooler**, and copy its Postgres URI. The session pooler uses port `5432` and works with Railway's IPv4 network. Put the complete URI in Railway as the secret `DATABASE_URL`; percent-encode special characters in the database password if constructing the URI manually. Do not use the Supabase project URL, anon key, service-role key, or transaction REST API—Prism connects directly to Postgres.
 
-Prism creates an isolated `prism` schema plus `metadata` and `signal_outcomes` tables on first startup. Lifecycle updates use transactions and row locks, signal IDs are primary keys, and duplicate or stale transitions are rejected. TP1 remains the permanent WIN marker even if a runner later stops; TP2 remains a separate statistic. The pool is intentionally bounded at 1–3 connections and asyncpg's prepared-statement cache is disabled for Supavisor compatibility.
+Prism creates an isolated `prism` schema plus `metadata` and `signal_outcomes` tables on first startup. Lifecycle updates use transactions and row locks, signal IDs are primary keys, and duplicate or stale transitions are rejected. Publication timestamps, destination delivery results, retry counts, and Telegram channel message IDs are stored independently from lifecycle state. TP1 remains the permanent WIN marker even if a runner later stops; TP2 remains a separate statistic. The pool is intentionally bounded at 1–3 connections and asyncpg's prepared-statement cache is disabled for Supavisor compatibility.
 
 ### One-signal historical reconciliation
 

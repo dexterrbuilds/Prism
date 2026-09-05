@@ -8,7 +8,7 @@ import pytest
 
 from app.api.health import RuntimeHealth
 from app.config import Settings
-from app.models import CandleSeries, Direction, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
+from app.models import CandleSeries, Direction, MarketRegime, PublicationState, Signal, SignalGrade, SignalState, TradePlan
 from app.scanner import Scanner, select_best_signal
 
 
@@ -36,8 +36,15 @@ class FakeTelegram:
         self.published = 0
         self.signals: list[Signal] = []
 
-    async def publish(self, signal, lifecycle: bool = False, chart_png: bytes | None = None) -> bool:
-        del lifecycle, chart_png
+    async def publish(
+        self,
+        signal,
+        lifecycle: bool = False,
+        chart_png: bytes | None = None,
+        *,
+        destinations: tuple[str, ...] | None = None,
+    ) -> bool:
+        del lifecycle, chart_png, destinations
         self.published += 1
         self.signals.append(signal)
         return True
@@ -82,6 +89,8 @@ async def test_lifecycle_monitor_emits_entry_only_once(monkeypatch: pytest.Monke
             created_at=now - timedelta(minutes=1),
             state_changed_at=now - timedelta(minutes=1),
             expires_at=now + timedelta(hours=6),
+            publication_state=PublicationState.PUBLISHED,
+            published_at=now - timedelta(minutes=1),
         )
     )
     await scanner._monitor_open_setups()
@@ -180,6 +189,8 @@ async def test_pnl_card_failure_cannot_fail_symbol_scan(monkeypatch: pytest.Monk
         current_price=100,
         state_changed_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
         activated_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
+        publication_state=PublicationState.PUBLISHED,
+        published_at=datetime.fromtimestamp((as_of_ms - 1_800_000) / 1000, UTC),
     )
     scanner.store.restore(active)
 

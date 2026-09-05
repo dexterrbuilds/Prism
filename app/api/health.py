@@ -22,6 +22,10 @@ class RuntimeHealth:
     reentries_issued: int = 0
     same_symbol_concurrent_signals: int = 0
     orphaned_signals_reconciled: int = 0
+    publication_successes: int = 0
+    publication_failures: int = 0
+    dm_delivery_failures: int = 0
+    lifecycle_notifications_suppressed: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -53,6 +57,10 @@ def create_app(health: RuntimeHealth) -> FastAPI:
             "reentries_issued": health.reentries_issued,
             "same_symbol_concurrent_signals": health.same_symbol_concurrent_signals,
             "orphaned_signals_reconciled": health.orphaned_signals_reconciled,
+            "publication_successes": health.publication_successes,
+            "publication_failures": health.publication_failures,
+            "dm_delivery_failures": health.dm_delivery_failures,
+            "lifecycle_notifications_suppressed": health.lifecycle_notifications_suppressed,
         }
 
     return app

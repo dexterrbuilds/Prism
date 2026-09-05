@@ -9,7 +9,7 @@ import pytest
 
 from app.api.health import RuntimeHealth
 from app.config import Settings
-from app.models import CandleSeries, Direction, EntryDecision, EntryQuality, SignalMode, SignalState, TradePlan
+from app.models import CandleSeries, Direction, EntryDecision, EntryQuality, PublicationState, SignalMode, SignalState, TradePlan
 from app.scanner import Scanner
 from app.signals.lifecycle import SignalStore, build_setup_fingerprint, create_signal_id, transition
 from app.signals.outcomes import OutcomeLedger
@@ -392,8 +392,22 @@ async def test_scanner_startup_reconciliation_repairs_all_persisted_instances(
     )
     metadata.commit()
     metadata.close()
-    first = replace(_active("A"), created_at=started, state_changed_at=started, activated_at=started)
-    second = replace(_active("B", tp1=105.5), created_at=started, state_changed_at=started, activated_at=started)
+    first = replace(
+        _active("A"),
+        created_at=started,
+        state_changed_at=started,
+        activated_at=started,
+        publication_state=PublicationState.PUBLISHED,
+        published_at=started,
+    )
+    second = replace(
+        _active("B", tp1=105.5),
+        created_at=started,
+        state_changed_at=started,
+        activated_at=started,
+        publication_state=PublicationState.PUBLISHED,
+        published_at=started,
+    )
     assert await repository.record_signal(first)
     assert await repository.record_signal(second)
 

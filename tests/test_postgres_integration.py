@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg  # type: ignore[import-untyped]
 import pytest
 
-from app.models import SignalState
+from app.models import PublicationState, SignalState
 from app.signals.lifecycle import transition
 from app.signals.postgres_outcomes import PostgresOutcomeRepository
 from tests.test_lifecycle import make_signal
@@ -38,13 +38,26 @@ async def test_postgres_v2_schema_and_outcome_round_trip() -> None:
     )
     try:
         assert await repository.record_signal(active)
-        winner = transition(active, SignalState.TP1_HIT, current_price=105, changed_at=started + timedelta(minutes=5))
+        published = replace(
+            active,
+            publication_state=PublicationState.PUBLISHED,
+            published_at=started + timedelta(seconds=1),
+            channel_published_at=started + timedelta(seconds=1),
+            channel_message_id="123",
+            intended_destination_ids=("-100123",),
+            delivered_destination_ids=("-100123",),
+            publish_attempts=1,
+        )
+        assert await repository.record_publication(published)
+        winner = transition(published, SignalState.TP1_HIT, current_price=105, changed_at=started + timedelta(minutes=5))
         assert await repository.record_event(winner)
         assert await repository.record_observation(replace(winner, mae=1.5, mfe=5.0))
         loaded = await repository.load_signal(active.id)
         assert loaded is not None
         assert loaded.id == active.id
         assert loaded.state is SignalState.TP1_HIT
+        assert loaded.publication_state is PublicationState.PUBLISHED
+        assert loaded.channel_message_id == "123"
         stats = await repository.stats()
         assert stats.wins >= 1
         assert stats.by_mode["INTRADAY"]["wins"] >= 1
@@ -119,11 +132,23 @@ async def test_postgres_identity_migration_is_additive_and_creates_backup() -> N
         backup_count = await connection.fetchval(
             "SELECT COUNT(*) FROM prism_identity_migration_test.signal_outcomes_pre_identity_v3_backup"
         )
+        publication_backup_count = await connection.fetchval(
+            "SELECT COUNT(*) FROM prism_identity_migration_test.signal_outcomes_pre_publication_v4_backup"
+        )
         event_count = await connection.fetchval(
             "SELECT COUNT(*) FROM prism_identity_migration_test.signal_events WHERE signal_id = 'legacy-id'"
         )
-        assert {"setup_fingerprint", "last_evaluated_at", "terminal_state", "result"} <= columns
+        assert {
+            "setup_fingerprint",
+            "last_evaluated_at",
+            "terminal_state",
+            "result",
+            "publication_state",
+            "published_at",
+            "channel_message_id",
+        } <= columns
         assert backup_count == 1
+        assert publication_backup_count == 1
         assert event_count == 1
     finally:
         await connection.execute("DROP SCHEMA prism_identity_migration_test CASCADE")

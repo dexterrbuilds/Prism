@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import uuid4
 
-from app.models import Direction, EntryQuality, Signal, SignalMode, SignalState
+from app.models import Direction, EntryQuality, PublicationState, Signal, SignalMode, SignalState
 
 WAITING_STATES = frozenset(
     {
@@ -126,6 +126,10 @@ def transition(
         result = "NO_TRADE"
     terminal = target in TERMINAL_STATES
 
+    publication_state = signal.publication_state
+    if target is SignalState.ENTRY_READY and publication_state is PublicationState.INTERNAL_ONLY:
+        publication_state = PublicationState.PUBLISH_PENDING
+
     return replace(
         signal,
         state=target,
@@ -153,6 +157,7 @@ def transition(
         terminal_state=target.value if terminal else signal.terminal_state,
         terminal_at=event_at if terminal and signal.terminal_at is None else signal.terminal_at,
         result=result,
+        publication_state=publication_state,
     )
 
 
@@ -306,6 +311,10 @@ class SignalStore:
         target_atr: float = 0.25,
     ) -> DuplicateMatch | None:
         for existing in reversed(tuple(self._signals.values())):
+            # A candidate already registered for lifecycle monitoring must not
+            # suppress its own first publication.
+            if existing.id == signal.id:
+                continue
             if existing.state not in OPEN_STATES:
                 continue
             if (

@@ -17,6 +17,7 @@ from app.models import (
     EntryDecision,
     EntryQuality,
     MarketRegime,
+    PublicationState,
     Signal,
     SignalGrade,
     SignalMode,
@@ -146,6 +147,17 @@ def serialize_signal(signal: Signal) -> str:
         "terminal_state": signal.terminal_state,
         "terminal_at": _iso(signal.terminal_at),
         "result": signal.result,
+        "publication_state": signal.publication_state.value,
+        "published_at": _iso(signal.published_at),
+        "channel_published_at": _iso(signal.channel_published_at),
+        "channel_message_id": signal.channel_message_id,
+        "dm_delivery_attempted_at": _iso(signal.dm_delivery_attempted_at),
+        "dm_success_count": signal.dm_success_count,
+        "dm_failure_count": signal.dm_failure_count,
+        "publish_attempts": signal.publish_attempts,
+        "last_publish_error": signal.last_publish_error,
+        "intended_destination_ids": list(signal.intended_destination_ids),
+        "delivered_destination_ids": list(signal.delivered_destination_ids),
     }
     return json.dumps(data, separators=(",", ":"), allow_nan=False)
 
@@ -242,6 +254,17 @@ def deserialize_signal(raw: str) -> Signal:
         terminal_state=str(data["terminal_state"]) if data.get("terminal_state") else None,
         terminal_at=_datetime(data.get("terminal_at")),
         result=str(data["result"]) if data.get("result") else None,
+        publication_state=PublicationState(data.get("publication_state", PublicationState.LEGACY_UNKNOWN.value)),
+        published_at=_datetime(data.get("published_at")),
+        channel_published_at=_datetime(data.get("channel_published_at")),
+        channel_message_id=str(data["channel_message_id"]) if data.get("channel_message_id") else None,
+        dm_delivery_attempted_at=_datetime(data.get("dm_delivery_attempted_at")),
+        dm_success_count=int(data.get("dm_success_count", 0)),
+        dm_failure_count=int(data.get("dm_failure_count", 0)),
+        publish_attempts=int(data.get("publish_attempts", 0)),
+        last_publish_error=str(data["last_publish_error"]) if data.get("last_publish_error") else None,
+        intended_destination_ids=tuple(str(item) for item in data.get("intended_destination_ids", ())),
+        delivered_destination_ids=tuple(str(item) for item in data.get("delivered_destination_ids", ())),
     )
 
 
@@ -279,9 +302,31 @@ class OutcomeLedger:
             "terminal_at",
             "result",
         }
+        backup_created = False
         if table_exists and not identity_columns.issubset(pre_migration_columns):
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
             backup_path = f"{self.path}.pre_identity_v3.{stamp}.bak"
+            backup = sqlite3.connect(backup_path)
+            try:
+                self._connection.backup(backup)
+            finally:
+                backup.close()
+            logger.info("outcome_database_backup_created backend=sqlite path=%s", backup_path)
+            backup_created = True
+        publication_columns = {
+            "publication_state",
+            "published_at",
+            "channel_published_at",
+            "channel_message_id",
+            "dm_delivery_attempted_at",
+            "dm_success_count",
+            "dm_failure_count",
+            "publish_attempts",
+            "last_publish_error",
+        }
+        if table_exists and not publication_columns.issubset(pre_migration_columns) and not backup_created:
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = f"{self.path}.pre_publication_v4.{stamp}.bak"
             backup = sqlite3.connect(backup_path)
             try:
                 self._connection.backup(backup)
@@ -334,6 +379,15 @@ class OutcomeLedger:
                 terminal_state TEXT,
                 terminal_at TEXT,
                 result TEXT,
+                publication_state TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN',
+                published_at TEXT,
+                channel_published_at TEXT,
+                channel_message_id TEXT,
+                dm_delivery_attempted_at TEXT,
+                dm_success_count INTEGER NOT NULL DEFAULT 0,
+                dm_failure_count INTEGER NOT NULL DEFAULT 0,
+                publish_attempts INTEGER NOT NULL DEFAULT 0,
+                last_publish_error TEXT,
                 win INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             );
@@ -377,6 +431,15 @@ class OutcomeLedger:
             "terminal_state": "TEXT",
             "terminal_at": "TEXT",
             "result": "TEXT",
+            "publication_state": "TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN'",
+            "published_at": "TEXT",
+            "channel_published_at": "TEXT",
+            "channel_message_id": "TEXT",
+            "dm_delivery_attempted_at": "TEXT",
+            "dm_success_count": "INTEGER NOT NULL DEFAULT 0",
+            "dm_failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "publish_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "last_publish_error": "TEXT",
         }
         for column, column_type in migrations.items():
             if column not in existing_columns:
@@ -390,6 +453,9 @@ class OutcomeLedger:
         )
         self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_symbol_state ON signal_outcomes(symbol, state)"
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_outcomes_publication ON signal_outcomes(publication_state, state)"
         )
         # Preserve an auditable snapshot for legacy rows without inventing a
         # lifecycle path that was never recorded.
@@ -430,9 +496,12 @@ class OutcomeLedger:
                 mae, mfe, stopped_then_target_reached, follow_up_until,
                 setup_fingerprint, signal_type, parent_signal_id, setup_origin_at,
                 major_structure_level, last_evaluated_at, terminal_state,
-                terminal_at, result, payload
+                terminal_at, result, publication_state, published_at,
+                channel_published_at, channel_message_id, dm_delivery_attempted_at,
+                dm_success_count, dm_failure_count, publish_attempts,
+                last_publish_error, payload
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -463,6 +532,15 @@ class OutcomeLedger:
                 signal.terminal_state,
                 _iso(signal.terminal_at),
                 signal.result,
+                signal.publication_state.value,
+                _iso(signal.published_at),
+                _iso(signal.channel_published_at),
+                signal.channel_message_id,
+                _iso(signal.dm_delivery_attempted_at),
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
                 serialize_signal(signal),
             ),
         )
@@ -478,6 +556,7 @@ class OutcomeLedger:
                 "state": signal.state.value,
                 "reason": signal.lifecycle_reason,
                 "setup_fingerprint": signal.setup_fingerprint,
+                "publication_state": signal.publication_state.value,
             },
             separators=(",", ":"),
         )
@@ -546,6 +625,15 @@ class OutcomeLedger:
             "terminal_state = ?",
             "terminal_at = ?",
             "result = ?",
+            "publication_state = ?",
+            "published_at = ?",
+            "channel_published_at = ?",
+            "channel_message_id = ?",
+            "dm_delivery_attempted_at = ?",
+            "dm_success_count = ?",
+            "dm_failure_count = ?",
+            "publish_attempts = ?",
+            "last_publish_error = ?",
         ]
         values: list[Any] = [
             _iso(event_at),
@@ -570,6 +658,15 @@ class OutcomeLedger:
             signal.terminal_state,
             _iso(signal.terminal_at),
             signal.result,
+            signal.publication_state.value,
+            _iso(signal.published_at),
+            _iso(signal.channel_published_at),
+            signal.channel_message_id,
+            _iso(signal.dm_delivery_attempted_at),
+            signal.dm_success_count,
+            signal.dm_failure_count,
+            signal.publish_attempts,
+            signal.last_publish_error,
         ]
         for timestamp_field in timestamp_fields:
             assignments.append(f"{timestamp_field} = COALESCE({timestamp_field}, ?)")
@@ -594,7 +691,11 @@ class OutcomeLedger:
             SET updated_at = ?, current_price = ?, mae = ?, mfe = ?,
                 stopped_then_target_reached = ?, follow_up_until = ?,
                 last_evaluated_at = ?, terminal_state = ?, terminal_at = ?,
-                result = ?, payload = ?
+                result = ?, publication_state = ?, published_at = ?,
+                channel_published_at = ?, channel_message_id = ?,
+                dm_delivery_attempted_at = ?, dm_success_count = ?,
+                dm_failure_count = ?, publish_attempts = ?, last_publish_error = ?,
+                payload = ?
             WHERE signal_id = ?
             """,
             (
@@ -608,12 +709,63 @@ class OutcomeLedger:
                 signal.terminal_state,
                 _iso(signal.terminal_at),
                 signal.result,
+                signal.publication_state.value,
+                _iso(signal.published_at),
+                _iso(signal.channel_published_at),
+                signal.channel_message_id,
+                _iso(signal.dm_delivery_attempted_at),
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
                 serialize_signal(signal),
                 signal.id,
             ),
         )
         self._connection.commit()
         return cursor.rowcount == 1
+
+    def record_publication(self, signal: Signal) -> bool:
+        """Persist Telegram publication metadata without changing lifecycle state."""
+        event_at = signal.published_at or signal.dm_delivery_attempted_at or datetime.now(UTC)
+        cursor = self._connection.execute(
+            """
+            UPDATE signal_outcomes
+            SET updated_at = ?, publication_state = ?, published_at = ?,
+                channel_published_at = ?, channel_message_id = ?,
+                dm_delivery_attempted_at = ?, dm_success_count = ?,
+                dm_failure_count = ?, publish_attempts = ?, last_publish_error = ?,
+                payload = ?
+            WHERE signal_id = ?
+            """,
+            (
+                _iso(datetime.now(UTC)),
+                signal.publication_state.value,
+                _iso(signal.published_at),
+                _iso(signal.channel_published_at),
+                signal.channel_message_id,
+                _iso(signal.dm_delivery_attempted_at),
+                signal.dm_success_count,
+                signal.dm_failure_count,
+                signal.publish_attempts,
+                signal.last_publish_error,
+                serialize_signal(signal),
+                signal.id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            self._connection.rollback()
+            return False
+        event_type = (
+            "INITIAL_PUBLISHED"
+            if signal.publication_state is PublicationState.PUBLISHED
+            else "UNPUBLISHED_TERMINAL"
+            if signal.publication_state is PublicationState.UNPUBLISHED_TERMINAL
+            else "PUBLISH_FAILED"
+        )
+        self._record_event_row(signal, event_type, event_at)
+        self._connection.commit()
+        return True
 
     def load_signal(self, signal_id: str) -> Signal | None:
         """Load one exact immutable signal instance, including terminal rows."""

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.models import Direction, EntryDecision, EntryQuality, MarketRegime, Signal, SignalGrade, SignalState, TradePlan
+from app.models import Direction, EntryDecision, EntryQuality, MarketRegime, PublicationState, Signal, SignalGrade, SignalState, TradePlan
 from app.signals.lifecycle import SignalStore, transition
 
 
@@ -71,9 +71,22 @@ def test_deduplication_collapses_strategy_labels_for_same_direction() -> None:
 def test_created_and_waiting_are_deduplicated_as_the_same_setup() -> None:
     store = SignalStore()
     created = replace(make_waiting_signal(), state=SignalState.CREATED)
-    waiting = replace(created, state=SignalState.WAITING_ENTRY)
+    waiting = replace(created, id="different-instance", state=SignalState.WAITING_ENTRY)
     assert store.should_publish(created)
     assert not store.should_publish(waiting)
+
+
+def test_signal_never_deduplicates_against_its_own_id_before_first_publication() -> None:
+    store = SignalStore()
+    candidate = replace(
+        make_waiting_signal(),
+        state=SignalState.ENTRY_READY,
+        publication_state=PublicationState.PUBLISH_PENDING,
+    )
+    store.restore(candidate)
+
+    assert store.find_duplicate(candidate) is None
+    assert store.should_publish(candidate)
 
 
 def test_signal_state_transitions_are_guarded() -> None:

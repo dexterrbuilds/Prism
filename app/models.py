@@ -111,6 +111,17 @@ class SignalState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class PublicationState(StrEnum):
+    """Telegram issuance state, deliberately separate from trade lifecycle."""
+
+    LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
+    INTERNAL_ONLY = "INTERNAL_ONLY"
+    PUBLISH_PENDING = "PUBLISH_PENDING"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PUBLISHED = "PUBLISHED"
+    UNPUBLISHED_TERMINAL = "UNPUBLISHED_TERMINAL"
+
+
 class SignalGrade(StrEnum):
     IGNORE = "IGNORE"
     WATCH = "WATCH"
@@ -376,6 +387,17 @@ class Signal:
     terminal_state: str | None = None
     terminal_at: datetime | None = None
     result: str | None = None
+    publication_state: PublicationState = PublicationState.LEGACY_UNKNOWN
+    published_at: datetime | None = None
+    channel_published_at: datetime | None = None
+    channel_message_id: str | None = None
+    dm_delivery_attempted_at: datetime | None = None
+    dm_success_count: int = 0
+    dm_failure_count: int = 0
+    publish_attempts: int = 0
+    last_publish_error: str | None = None
+    intended_destination_ids: tuple[str, ...] = ()
+    delivered_destination_ids: tuple[str, ...] = ()
 
     @staticmethod
     def utcnow() -> datetime:

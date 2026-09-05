@@ -111,11 +111,47 @@ def test_existing_sqlite_database_is_migrated_additively(tmp_path) -> None:
         "terminal_state",
         "terminal_at",
         "result",
+        "publication_state",
+        "published_at",
+        "channel_published_at",
+        "channel_message_id",
+        "dm_delivery_attempted_at",
+        "dm_success_count",
+        "dm_failure_count",
+        "publish_attempts",
+        "last_publish_error",
     } <= columns
     assert "signal_events" in tables
     assert preserved == ("legacy-id", "UNI/USDT", "ACTIVE")
     assert migrated_event == ("MIGRATED_SNAPSHOT",)
     assert len(list(tmp_path.glob("legacy.db.pre_identity_v3.*.bak"))) == 1
+
+
+def test_sqlite_publication_only_migration_creates_backup(tmp_path) -> None:
+    path = tmp_path / "pre-publication.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE signal_outcomes (
+            signal_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            state TEXT NOT NULL, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+            direction TEXT NOT NULL, score INTEGER NOT NULL, current_price REAL,
+            activated_at TEXT, tp1_hit_at TEXT, tp2_hit_at TEXT, stopped_at TEXT,
+            invalidated_at TEXT, win INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL,
+            setup_fingerprint TEXT, signal_type TEXT NOT NULL DEFAULT 'INITIAL',
+            parent_signal_id TEXT, setup_origin_at TEXT, major_structure_level REAL,
+            last_evaluated_at TEXT, terminal_state TEXT, terminal_at TEXT, result TEXT
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    ledger = OutcomeLedger(str(path))
+    ledger.close()
+
+    assert list(tmp_path.glob("pre-publication.db.pre_identity_v3.*.bak")) == []
+    assert len(list(tmp_path.glob("pre-publication.db.pre_publication_v4.*.bak"))) == 1
 
 
 @pytest.mark.asyncio
